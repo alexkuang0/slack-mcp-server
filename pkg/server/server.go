@@ -548,6 +548,20 @@ func (s *MCPServer) ServeSSE(addr string) *server.SSEServer {
 	)
 }
 
+// HTTPHandler returns the underlying mark3labs streamable HTTP handler so
+// callers can compose it onto a custom *http.ServeMux alongside other
+// endpoints (e.g. the OAuth AS routes in pkg/mcpauth/server). The endpoint
+// path is fixed to "/mcp" to match the AS metadata.
+func (s *MCPServer) HTTPHandler() http.Handler {
+	return server.NewStreamableHTTPServer(s.server,
+		server.WithEndpointPath("/mcp"),
+		server.WithHTTPContextFunc(func(ctx context.Context, r *http.Request) context.Context {
+			ctx = auth.AuthFromRequest(s.logger)(ctx, r)
+			return ctx
+		}),
+	)
+}
+
 func (s *MCPServer) ServeHTTP(addr string) *server.StreamableHTTPServer {
 	s.logger.Info("Creating HTTP server",
 		zap.String("context", "console"),

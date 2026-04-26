@@ -143,7 +143,7 @@ func TestUnitSQLiteAuthzCodeGC(t *testing.T) {
 	codes := []AuthzCode{
 		{
 			CodeHash: "expired-1", ClientID: "client-3",
-			RedirectURI: "https://app.example/cb",
+			RedirectURI:   "https://app.example/cb",
 			CodeChallenge: "c", CodeChallengeMethod: "S256",
 			Resource: "https://mcp.example", SlackTeamID: "T", SlackUserID: "U",
 			SlackAccessTokenEnc: []byte{0x01}, SlackScope: "x",
@@ -151,7 +151,7 @@ func TestUnitSQLiteAuthzCodeGC(t *testing.T) {
 		},
 		{
 			CodeHash: "expired-2", ClientID: "client-3",
-			RedirectURI: "https://app.example/cb",
+			RedirectURI:   "https://app.example/cb",
 			CodeChallenge: "c", CodeChallengeMethod: "S256",
 			Resource: "https://mcp.example", SlackTeamID: "T", SlackUserID: "U",
 			SlackAccessTokenEnc: []byte{0x01}, SlackScope: "x",
@@ -159,7 +159,7 @@ func TestUnitSQLiteAuthzCodeGC(t *testing.T) {
 		},
 		{
 			CodeHash: "fresh-1", ClientID: "client-3",
-			RedirectURI: "https://app.example/cb",
+			RedirectURI:   "https://app.example/cb",
 			CodeChallenge: "c", CodeChallengeMethod: "S256",
 			Resource: "https://mcp.example", SlackTeamID: "T", SlackUserID: "U",
 			SlackAccessTokenEnc: []byte{0x01}, SlackScope: "x",

@@ -339,10 +339,10 @@ func (s *SQLiteStore) LookupByRefresh(ctx context.Context, refreshHash string) (
 
 func scanToken(row *sql.Row) (*Token, error) {
 	var (
-		t            Token
-		expires      time.Time
-		refreshEnc   []byte
-		refreshHash  string
+		t           Token
+		expires     time.Time
+		refreshEnc  []byte
+		refreshHash string
 	)
 	if err := row.Scan(
 		&t.TokenHash, &t.ClientID, &t.SlackTeamID, &t.SlackUserID,
@@ -396,4 +396,22 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// ExpireTokenForTest forcibly sets a token's expires_at into the past. It is
+// the only way for tests to drive bearer-middleware expiry without sleeping
+// through wall-clock time. Returns rows affected.
+func (s *SQLiteStore) ExpireTokenForTest(ctx context.Context, tokenHash string) (int, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE oauth_tokens SET expires_at = ? WHERE token_hash = ?`,
+		time.Now().UTC().Add(-1*time.Hour), tokenHash,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("mcpauth/store: expire token: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("mcpauth/store: rows affected: %w", err)
+	}
+	return int(n), nil
 }

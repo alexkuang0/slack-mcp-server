@@ -11,6 +11,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/korotovsky/slack-mcp-server/pkg/mcpauth"
+	mcpauthserver "github.com/korotovsky/slack-mcp-server/pkg/mcpauth/server"
+	"github.com/korotovsky/slack-mcp-server/pkg/mcpauth/store"
 	"github.com/korotovsky/slack-mcp-server/pkg/provider"
 	"github.com/korotovsky/slack-mcp-server/pkg/server"
 	"github.com/mattn/go-isatty"
@@ -20,6 +23,11 @@ import (
 
 var defaultSseHost = "127.0.0.1"
 var defaultSsePort = 13080
+
+// Default SQLite DSN for the OAuth store. Operators can override via
+// SLACK_MCP_OAUTH_STORAGE_DSN; the default points at /var/lib for Docker
+// installs but tests/dev use whatever the operator passes.
+const defaultOAuthStorageDSN = "file:/var/lib/slack-mcp/oauth.db?cache=shared&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)"
 
 func main() {
 	var transport string
@@ -67,11 +75,30 @@ func main() {
 		)
 	}
 
+	switch detectMode() {
+	case "legacy":
+		runLegacy(transport, enabledTools, logger)
+	case "oauth":
+		runOAuth(transport, enabledTools, logger)
+	}
+}
+
+// detectMode returns "legacy" when any of the single-tenant token env vars are
+// set, or "oauth" otherwise. This is the entry-point switch documented in the
+// Phase 5 plan.
+func detectMode() string {
+	if os.Getenv("SLACK_MCP_XOXP_TOKEN") != "" ||
+		os.Getenv("SLACK_MCP_XOXB_TOKEN") != "" ||
+		(os.Getenv("SLACK_MCP_XOXC_TOKEN") != "" && os.Getenv("SLACK_MCP_XOXD_TOKEN") != "") {
+		return "legacy"
+	}
+	return "oauth"
+}
+
+// runLegacy is the existing single-tenant path: env-derived ApiProvider,
+// optional cache warm-up, then ServeStdio/SSE/HTTP.
+func runLegacy(transport string, enabledTools []string, logger *zap.Logger) {
 	p := provider.New(transport, logger)
-	// Wrap the singleton provider in a Factory so handlers always go through
-	// the per-tenant indirection. In legacy single-tenant mode this is a
-	// thin pass-through. Multi-tenant transports (Phase 5+) will replace
-	// this with NewMultiTenantFactory.
 	factory := provider.NewLegacyFactory(p)
 	s := server.NewMCPServer(factory, logger, enabledTools)
 
@@ -171,6 +198,162 @@ func main() {
 			zap.String("allowed", "stdio, sse, http"),
 		)
 	}
+}
+
+// runOAuth boots the multi-tenant MCP-AS path. Stdio/SSE are disallowed in this
+// mode — multi-tenant only makes sense over HTTP.
+func runOAuth(transport string, enabledTools []string, logger *zap.Logger) {
+	if transport == "stdio" {
+		logger.Fatal("OAuth multi-tenant mode does not support stdio transport. Use -t http.",
+			zap.String("context", "console"),
+		)
+	}
+	if transport == "sse" {
+		logger.Fatal("OAuth multi-tenant mode does not support sse transport. Use -t http.",
+			zap.String("context", "console"),
+		)
+	}
+
+	cfg, err := loadOAuthConfig()
+	if err != nil {
+		logger.Fatal("OAuth config error",
+			zap.String("context", "console"),
+			zap.Error(err),
+		)
+	}
+
+	storage, err := store.OpenSQLite(context.Background(), cfg.StorageDSN)
+	if err != nil {
+		logger.Fatal("Failed to open OAuth storage",
+			zap.String("context", "console"),
+			zap.Error(err),
+		)
+	}
+
+	crypto, err := mcpauth.NewCryptoFromBase64(cfg.MasterKeyB64)
+	if err != nil {
+		logger.Fatal("Failed to initialize OAuth crypto",
+			zap.String("context", "console"),
+			zap.Error(err),
+		)
+	}
+
+	factory := provider.NewMultiTenantFactory(provider.MultiTenantConfig{
+		Logger: logger,
+		BuildProvider: func(ctx context.Context, t provider.TenantContext) (*provider.ApiProvider, error) {
+			if t.SlackToken == "" {
+				// Boot-time call from pkg/server.NewMCPServer that resolves
+				// the "default" provider for transport/auth-test wiring. No
+				// real Slack token is available yet — return a stub. Real
+				// per-request paths arrive with t.SlackToken populated by
+				// the bearer middleware.
+				return provider.NewBootStubProvider(transport, logger), nil
+			}
+			return provider.NewWithToken(transport, t.SlackToken, logger)
+		},
+	})
+
+	mcp := server.NewMCPServer(factory, logger, enabledTools)
+
+	asServer := &mcpauthserver.Server{
+		Logger: logger,
+		Store:  storage,
+		Crypto: crypto,
+		SlackOAuth: &mcpauth.SlackOAuthConfig{
+			ClientID:     cfg.SlackClientID,
+			ClientSecret: cfg.SlackClientSecret,
+			RedirectURI:  cfg.SlackRedirectURI,
+			UserScopes:   cfg.UserScopes,
+			BotScopes:    cfg.BotScopes,
+		},
+		Factory: factory,
+		Issuer:  cfg.Issuer,
+	}
+
+	host := os.Getenv("SLACK_MCP_HOST")
+	if host == "" {
+		host = defaultSseHost
+	}
+	port := os.Getenv("SLACK_MCP_PORT")
+	if port == "" {
+		port = strconv.Itoa(defaultSsePort)
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/healthz", server.HealthzHandler(logger))
+	asServer.Mount(mux, mcp.HTTPHandler())
+
+	logger.Info(
+		fmt.Sprintf("OAuth multi-tenant HTTP server listening on %s:%s", host, port),
+		zap.String("context", "console"),
+		zap.String("issuer", cfg.Issuer),
+	)
+	if err := http.ListenAndServe(host+":"+port, mux); err != nil {
+		logger.Fatal("Server error",
+			zap.String("context", "console"),
+			zap.Error(err),
+		)
+	}
+}
+
+// oauthConfig is the bundle of env-derived configuration for OAuth mode.
+type oauthConfig struct {
+	SlackClientID     string
+	SlackClientSecret string
+	SlackRedirectURI  string
+	MasterKeyB64      string
+	StorageDSN        string
+	Issuer            string
+	UserScopes        []string
+	BotScopes         []string
+}
+
+func loadOAuthConfig() (*oauthConfig, error) {
+	c := &oauthConfig{
+		SlackClientID:     os.Getenv("SLACK_MCP_OAUTH_CLIENT_ID"),
+		SlackClientSecret: os.Getenv("SLACK_MCP_OAUTH_CLIENT_SECRET"),
+		SlackRedirectURI:  os.Getenv("SLACK_MCP_OAUTH_REDIRECT_URI"),
+		MasterKeyB64:      os.Getenv("SLACK_MCP_OAUTH_MASTER_KEY"),
+		StorageDSN:        os.Getenv("SLACK_MCP_OAUTH_STORAGE_DSN"),
+		Issuer:            os.Getenv("SLACK_MCP_OAUTH_ISSUER"),
+	}
+	if c.SlackClientID == "" {
+		return nil, fmt.Errorf("SLACK_MCP_OAUTH_CLIENT_ID is required in OAuth mode")
+	}
+	if c.SlackClientSecret == "" {
+		return nil, fmt.Errorf("SLACK_MCP_OAUTH_CLIENT_SECRET is required in OAuth mode")
+	}
+	if c.SlackRedirectURI == "" {
+		return nil, fmt.Errorf("SLACK_MCP_OAUTH_REDIRECT_URI is required in OAuth mode")
+	}
+	if c.MasterKeyB64 == "" {
+		return nil, fmt.Errorf("SLACK_MCP_OAUTH_MASTER_KEY is required in OAuth mode")
+	}
+	if c.Issuer == "" {
+		return nil, fmt.Errorf("SLACK_MCP_OAUTH_ISSUER is required in OAuth mode")
+	}
+	if c.StorageDSN == "" {
+		c.StorageDSN = defaultOAuthStorageDSN
+	}
+	if userScopes := os.Getenv("SLACK_MCP_OAUTH_USER_SCOPES"); userScopes != "" {
+		c.UserScopes = splitAndTrim(userScopes)
+	}
+	if botScopes := os.Getenv("SLACK_MCP_OAUTH_BOT_SCOPES"); botScopes != "" {
+		c.BotScopes = splitAndTrim(botScopes)
+	}
+	return c, nil
+}
+
+func splitAndTrim(csv string) []string {
+	parts := strings.Split(csv, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func newUsersWatcher(p *provider.ApiProvider, once *sync.Once, logger *zap.Logger) func() {

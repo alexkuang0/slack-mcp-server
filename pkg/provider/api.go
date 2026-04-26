@@ -228,11 +228,11 @@ type MCPSlackClient struct {
 	authResponse *slack.AuthTestResponse
 	authProvider auth.Provider
 
-	isEnterprise  bool
-	isOAuth       bool
-	isBotToken    bool
-	edgeFailed    bool // set when edge API fails; subsequent calls skip straight to standard API
-	teamEndpoint  string
+	isEnterprise bool
+	isOAuth      bool
+	isBotToken   bool
+	edgeFailed   bool // set when edge API fails; subsequent calls skip straight to standard API
+	teamEndpoint string
 }
 
 type ApiProvider struct {
@@ -616,6 +616,181 @@ func New(transport string, logger *zap.Logger) *ApiProvider {
 	}
 
 	return newWithXOXC(transport, authProvider, logger)
+}
+
+// bootStubClient is a minimal SlackAPI used by NewBootStubProvider. Only
+// AuthTest is meaningful; every other method panics, because no real client
+// should ever invoke them — they only run in handlers reached through the
+// multi-tenant factory, which builds a real *MCPSlackClient.
+type bootStubClient struct{}
+
+func (b *bootStubClient) AuthTest() (*slack.AuthTestResponse, error) {
+	return &slack.AuthTestResponse{
+		URL:    "https://_oauth.slack.com/",
+		Team:   "OAuth Boot Stub",
+		User:   "boot",
+		TeamID: "TBOOT",
+		UserID: "UBOOT",
+	}, nil
+}
+func (b *bootStubClient) AuthTestContext(context.Context) (*slack.AuthTestResponse, error) {
+	return b.AuthTest()
+}
+func (b *bootStubClient) GetUsersContext(context.Context, ...slack.GetUsersOption) ([]slack.User, error) {
+	panic("bootStubClient: GetUsersContext invoked; tenant context missing")
+}
+func (b *bootStubClient) GetUsersInfo(...string) (*[]slack.User, error) {
+	panic("bootStubClient: GetUsersInfo invoked; tenant context missing")
+}
+func (b *bootStubClient) PostMessageContext(context.Context, string, ...slack.MsgOption) (string, string, error) {
+	panic("bootStubClient: PostMessageContext invoked; tenant context missing")
+}
+func (b *bootStubClient) MarkConversationContext(context.Context, string, string) error {
+	panic("bootStubClient: MarkConversationContext invoked; tenant context missing")
+}
+func (b *bootStubClient) AddReactionContext(context.Context, string, slack.ItemRef) error {
+	panic("bootStubClient: AddReactionContext invoked; tenant context missing")
+}
+func (b *bootStubClient) RemoveReactionContext(context.Context, string, slack.ItemRef) error {
+	panic("bootStubClient: RemoveReactionContext invoked; tenant context missing")
+}
+func (b *bootStubClient) GetConversationHistoryContext(context.Context, *slack.GetConversationHistoryParameters) (*slack.GetConversationHistoryResponse, error) {
+	panic("bootStubClient: GetConversationHistoryContext invoked; tenant context missing")
+}
+func (b *bootStubClient) GetConversationRepliesContext(context.Context, *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error) {
+	panic("bootStubClient: GetConversationRepliesContext invoked; tenant context missing")
+}
+func (b *bootStubClient) SearchContext(context.Context, string, slack.SearchParameters) (*slack.SearchMessages, *slack.SearchFiles, error) {
+	panic("bootStubClient: SearchContext invoked; tenant context missing")
+}
+func (b *bootStubClient) GetFileInfoContext(context.Context, string, int, int) (*slack.File, []slack.Comment, *slack.Paging, error) {
+	panic("bootStubClient: GetFileInfoContext invoked; tenant context missing")
+}
+func (b *bootStubClient) GetFileContext(context.Context, string, io.Writer) error {
+	panic("bootStubClient: GetFileContext invoked; tenant context missing")
+}
+func (b *bootStubClient) GetConversationInfoContext(context.Context, *slack.GetConversationInfoInput) (*slack.Channel, error) {
+	panic("bootStubClient: GetConversationInfoContext invoked; tenant context missing")
+}
+func (b *bootStubClient) GetConversationsContext(context.Context, *slack.GetConversationsParameters) ([]slack.Channel, string, error) {
+	panic("bootStubClient: GetConversationsContext invoked; tenant context missing")
+}
+func (b *bootStubClient) GetConversationsForUserContext(context.Context, *slack.GetConversationsForUserParameters) ([]slack.Channel, string, error) {
+	panic("bootStubClient: GetConversationsForUserContext invoked; tenant context missing")
+}
+func (b *bootStubClient) ClientUserBoot(context.Context) (*edge.ClientUserBootResponse, error) {
+	panic("bootStubClient: ClientUserBoot invoked; tenant context missing")
+}
+func (b *bootStubClient) UsersSearch(context.Context, string, int) ([]slack.User, error) {
+	panic("bootStubClient: UsersSearch invoked; tenant context missing")
+}
+func (b *bootStubClient) ClientCounts(context.Context) (edge.ClientCountsResponse, error) {
+	panic("bootStubClient: ClientCounts invoked; tenant context missing")
+}
+func (b *bootStubClient) GetMutedChannels(context.Context) (map[string]bool, error) {
+	panic("bootStubClient: GetMutedChannels invoked; tenant context missing")
+}
+func (b *bootStubClient) GetUserGroupsContext(context.Context, ...slack.GetUserGroupsOption) ([]slack.UserGroup, error) {
+	panic("bootStubClient: GetUserGroupsContext invoked; tenant context missing")
+}
+func (b *bootStubClient) GetUserGroupMembersContext(context.Context, string, ...slack.GetUserGroupMembersOption) ([]string, error) {
+	panic("bootStubClient: GetUserGroupMembersContext invoked; tenant context missing")
+}
+func (b *bootStubClient) CreateUserGroupContext(context.Context, slack.UserGroup, ...slack.CreateUserGroupOption) (slack.UserGroup, error) {
+	panic("bootStubClient: CreateUserGroupContext invoked; tenant context missing")
+}
+func (b *bootStubClient) UpdateUserGroupContext(context.Context, string, ...slack.UpdateUserGroupsOption) (slack.UserGroup, error) {
+	panic("bootStubClient: UpdateUserGroupContext invoked; tenant context missing")
+}
+func (b *bootStubClient) UpdateUserGroupMembersContext(context.Context, string, string, ...slack.UpdateUserGroupMembersOption) (slack.UserGroup, error) {
+	panic("bootStubClient: UpdateUserGroupMembersContext invoked; tenant context missing")
+}
+
+// NewBootStubProvider returns an *ApiProvider that satisfies the startup
+// contract pkg/server.NewMCPServer expects (ServerTransport, IsBotToken,
+// Slack().AuthTest()) but does not have a real Slack client.
+//
+// It exists so multi-tenant OAuth mode can run NewMCPServer at boot — when
+// no tenant is yet known — without panicking on AuthTest. Per-request work
+// goes through the multi-tenant factory and uses a real ApiProvider.
+//
+// The stub's AuthTest returns canned values so workspace URL parsing
+// (text.Workspace) succeeds. None of these values escape to clients.
+func NewBootStubProvider(transport string, logger *zap.Logger) *ApiProvider {
+	ap := &ApiProvider{
+		transport:          transport,
+		client:             &bootStubClient{},
+		logger:             logger,
+		rateLimiter:        limiter.Tier2.Limiter(),
+		cacheTTL:           getCacheTTL(),
+		minRefreshInterval: getMinRefreshInterval(),
+	}
+	ap.usersSnapshot.Store(&UsersCache{
+		Users:    make(map[string]slack.User),
+		UsersInv: make(map[string]string),
+	})
+	ap.channelsSnapshot.Store(&ChannelsCache{
+		Channels:    make(map[string]Channel),
+		ChannelsInv: make(map[string]string),
+	})
+	return ap
+}
+
+// NewWithToken constructs an *ApiProvider from a known Slack token (xoxp/xoxb).
+//
+// Unlike New, it does NOT read SLACK_MCP_XOXP_TOKEN / XOXB / XOXC / XOXD from
+// the environment — the token is supplied directly. This is the constructor
+// the multi-tenant OAuth path uses, where each request's bearer is resolved
+// to a per-tenant Slack token via the store package.
+//
+// On failure (invalid token, Slack auth.test rejection, network error) it
+// returns an error rather than calling logger.Fatal, so the caller can map
+// the failure into a 401/500 in the OAuth flow.
+func NewWithToken(transport, slackToken string, logger *zap.Logger) (*ApiProvider, error) {
+	if slackToken == "" {
+		return nil, errors.New("provider: empty slack token")
+	}
+	authProvider, err := auth.NewValueAuth(slackToken, "")
+	if err != nil {
+		return nil, err
+	}
+	teamID, err := validateAuthAndGetTeamID(authProvider, logger)
+	if err != nil {
+		return nil, err
+	}
+	usersCache := os.Getenv("SLACK_MCP_USERS_CACHE")
+	if usersCache == "" {
+		usersCache = getCachePathWithTeamID(teamID, "users_cache.json")
+	}
+	channelsCache := os.Getenv("SLACK_MCP_CHANNELS_CACHE")
+	if channelsCache == "" {
+		channelsCache = getCachePathWithTeamID(teamID, "channels_cache_v2.json")
+	}
+	client, err := NewMCPSlackClient(authProvider, logger)
+	if err != nil {
+		return nil, err
+	}
+	ap := &ApiProvider{
+		transport: transport,
+		client:    client,
+		logger:    logger,
+
+		rateLimiter:        limiter.Tier2.Limiter(),
+		cacheTTL:           getCacheTTL(),
+		minRefreshInterval: getMinRefreshInterval(),
+
+		usersCachePath:    usersCache,
+		channelsCachePath: channelsCache,
+	}
+	ap.usersSnapshot.Store(&UsersCache{
+		Users:    make(map[string]slack.User),
+		UsersInv: make(map[string]string),
+	})
+	ap.channelsSnapshot.Store(&ChannelsCache{
+		Channels:    make(map[string]Channel),
+		ChannelsInv: make(map[string]string),
+	})
+	return ap, nil
 }
 
 func newWithXOXP(transport string, authProvider auth.ValueAuth, logger *zap.Logger) *ApiProvider {
