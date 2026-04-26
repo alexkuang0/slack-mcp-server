@@ -10,6 +10,7 @@ Model Context Protocol (MCP) server for Slack Workspaces. The most powerful MCP 
 
 This feature-rich Slack MCP Server has:
 - **Stealth and OAuth Modes**: Run the server without requiring additional permissions or bot installations (stealth mode), or use secure OAuth tokens for access without needing to refresh or extract tokens from the browser (OAuth mode).
+- **Multi-tenant OAuth with Dynamic Client Registration**: Run a single shared deployment for an entire team — the server acts as an MCP-spec OAuth Authorization Server (RFC 7591 DCR + PKCE + RFC 8707 audience-bound tokens), bridges to Slack OAuth on first use, and stores per-user Slack credentials AES-GCM-encrypted in SQLite. See [docs/05-multi-tenant-oauth.md](docs/05-multi-tenant-oauth.md).
 - **Enterprise Workspaces Support**: Possibility to integrate with Enterprise Slack setups.
 - **Channel and Thread Support with `#Name` `@Lookup`**: Fetch messages from channels and threads, including activity messages, and retrieve channels using their names (e.g., #general) as well as their IDs.
 - **Smart History**: Fetch messages with pagination by date (d1, 7d, 1m) or message count.
@@ -240,6 +241,7 @@ Fetches a CSV directory of all users in the workspace.
 - [Authentication Setup](docs/01-authentication-setup.md)
 - [Installation](docs/02-installation.md)
 - [Configuration and Usage](docs/03-configuration-and-usage.md)
+- [Multi-tenant OAuth with DCR](docs/05-multi-tenant-oauth.md)
 
 ### Environment Variables (Quick Reference)
 
@@ -270,6 +272,22 @@ Fetches a CSV directory of all users in the workspace.
 
 *You need one of: `xoxp` (user), `xoxb` (bot), or both `xoxc`/`xoxd` tokens for authentication.
 
+#### OAuth multi-tenant mode
+
+When **none** of `SLACK_MCP_XOXP_TOKEN`, `SLACK_MCP_XOXB_TOKEN`, or both `SLACK_MCP_XOXC_TOKEN` + `SLACK_MCP_XOXD_TOKEN` are set, the server boots in multi-tenant OAuth mode and exposes an MCP-spec Authorization Server (RFC 7591 DCR + PKCE + RFC 8707) under the configured issuer. Setting any legacy token env var disables OAuth mode and the endpoints below are not registered. See [docs/05-multi-tenant-oauth.md](docs/05-multi-tenant-oauth.md) for the full setup guide.
+
+| Variable                          | Required? | Default                                                                                | Description                                                                                                                                                            |
+|-----------------------------------|-----------|----------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `SLACK_MCP_OAUTH_ISSUER`          | Yes       | `nil`                                                                                  | Public HTTPS issuer URL (e.g. `https://mcp.example.com`). Used as RFC 8414 issuer and as the RFC 8707 resource indicator base.                                         |
+| `SLACK_MCP_OAUTH_CLIENT_ID`       | Yes       | `nil`                                                                                  | Slack OAuth app Client ID.                                                                                                                                             |
+| `SLACK_MCP_OAUTH_CLIENT_SECRET`   | Yes       | `nil`                                                                                  | Slack OAuth app Client Secret.                                                                                                                                         |
+| `SLACK_MCP_OAUTH_REDIRECT_URI`    | Yes       | `nil`                                                                                  | Must be `${SLACK_MCP_OAUTH_ISSUER}/oauth/slack/callback` and configured exactly the same way in the Slack app.                                                         |
+| `SLACK_MCP_OAUTH_MASTER_KEY`      | Yes       | `nil`                                                                                  | 32-byte AES-GCM key, base64url-encoded (no padding). Generate with `head -c 32 /dev/urandom \| base64 \| tr '+/' '-_' \| tr -d '='`. Server refuses to boot without it. |
+| `SLACK_MCP_OAUTH_STORAGE_DSN`     | No        | `file:/var/lib/slack-mcp/oauth.db?cache=shared&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)` | SQLite DSN for the OAuth + token store. The `docker-compose.oauth.yml` bundle overrides this to `/data/oauth.db`. |
+| `SLACK_MCP_OAUTH_USER_SCOPES`     | No        | `nil`                                                                                  | Comma-separated Slack user scopes to request from end users. If empty, the server requests no user scopes (set this if you want xoxp tokens).                          |
+| `SLACK_MCP_OAUTH_BOT_SCOPES`      | No        | `nil`                                                                                  | Comma-separated Slack bot scopes to request. Empty = no bot token.                                                                                                     |
+| `SLACK_MCP_OAUTH_METRICS`         | No        | `nil`                                                                                  | Set to `true` to expose `/metrics` (expvar). Unauthenticated; firewall it.                                                                                             |
+
 ### Liveness probe
 
 When running with `-t sse` or `-t http`, the server exposes an unauthenticated `GET /healthz` endpoint on the same host/port. It returns HTTP 200 with a JSON body (`status`, `version`, `build_time`, `commit_hash`) regardless of Slack auth or cache-warmup state — it is a liveness probe only, not a readiness check. The bearer-token middleware (`SLACK_MCP_API_KEY`) is not applied to `/healthz`. For remote deployments, the streamable HTTP transport (`-t http`) is recommended over SSE.
@@ -288,9 +306,14 @@ When running with `-t sse` or `-t http`, the server exposes an unauthenticated `
 # Run the inspector with stdio transport
 npx @modelcontextprotocol/inspector go run mcp/mcp-server.go --transport stdio
 
+# Run the inspector against a remote streamable HTTP deployment (recommended for remote setups)
+npx @modelcontextprotocol/inspector https://mcp.example.com/mcp
+
 # View logs
 tail -n 20 -f ~/Library/Logs/Claude/mcp*.log
 ```
+
+For remote deployments, prefer streamable HTTP (`-t http`) over SSE (`-t sse`) — it is the transport the multi-tenant OAuth mode and most current MCP clients (Claude Desktop, mcp-inspector, Cursor) target. SSE remains supported for older clients.
 
 ## Security
 

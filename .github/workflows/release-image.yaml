@@ -6,8 +6,8 @@ on:
       - '*'
 
 env:
-  DOCKERHUB_IMAGE_NAME: korotovsky/slack-mcp-server
-  DOCKERHUB_USERNAME: korotovsky
+  # Publish under the repo owner's namespace so forks push to their own GHCR (not the upstream's).
+  IMAGE_NAME: ${{ github.repository_owner }}/slack-mcp-server
   TAG: ${{ github.ref_name == 'main' && 'latest' || github.ref_type == 'tag' && github.ref_name && startsWith(github.ref_name, 'v') && github.ref_name || 'unknown' }}
 
 jobs:
@@ -37,7 +37,7 @@ jobs:
         run: |
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
-            --tag ghcr.io/${{ env.DOCKERHUB_IMAGE_NAME }}:latest \
-            --tag ghcr.io/${{ env.DOCKERHUB_IMAGE_NAME }}:${{ env.TAG }} \
+            --tag ghcr.io/${{ env.IMAGE_NAME }}:latest \
+            --tag ghcr.io/${{ env.IMAGE_NAME }}:${{ env.TAG }} \
             --push \
             .

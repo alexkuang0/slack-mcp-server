@@ -1,0 +1,7 @@
+{$SLACK_MCP_DOMAIN} {
+    encode gzip
+
+    # Public, no auth: /healthz, /.well-known/*, /register, /authorize, /token, /revoke, /oauth/slack/callback
+    # Authenticated by MCP server: /mcp
+    reverse_proxy mcp-server:13080
+}

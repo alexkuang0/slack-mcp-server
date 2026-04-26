@@ -1,0 +1,41 @@
+services:
+  mcp-server:
+    image: ghcr.io/alexkuang0/slack-mcp-server:latest
+    restart: unless-stopped
+    networks:
+      - oauth-tier
+    expose:
+      - "13080"
+    volumes:
+      - oauth_data:/data
+    env_file:
+      - .env.oauth
+    environment:
+      SLACK_MCP_HOST: "0.0.0.0"
+      SLACK_MCP_PORT: "13080"
+      SLACK_MCP_OAUTH_STORAGE_DSN: "file:/data/oauth.db?cache=shared&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)"
+    command: ["--transport", "http"]
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    networks:
+      - oauth-tier
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - mcp-server
+
+volumes:
+  oauth_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  oauth-tier:
+    name: oauth-tier
