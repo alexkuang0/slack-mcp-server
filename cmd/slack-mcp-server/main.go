@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -114,7 +115,11 @@ func main() {
 			)
 		}
 
-		if err := sseServer.Start(host + ":" + port); err != nil {
+		mux := http.NewServeMux()
+		mux.Handle("/healthz", server.HealthzHandler(logger))
+		mux.Handle("/", sseServer)
+
+		if err := http.ListenAndServe(host+":"+port, mux); err != nil {
 			logger.Fatal("Server error",
 				zap.String("context", "console"),
 				zap.Error(err),
@@ -144,7 +149,11 @@ func main() {
 			)
 		}
 
-		if err := httpServer.Start(host + ":" + port); err != nil {
+		mux := http.NewServeMux()
+		mux.Handle("/healthz", server.HealthzHandler(logger))
+		mux.Handle("/mcp", httpServer)
+
+		if err := http.ListenAndServe(host+":"+port, mux); err != nil {
 			logger.Fatal("Server error",
 				zap.String("context", "console"),
 				zap.Error(err),

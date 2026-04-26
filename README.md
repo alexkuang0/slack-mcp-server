@@ -270,6 +270,10 @@ Fetches a CSV directory of all users in the workspace.
 
 *You need one of: `xoxp` (user), `xoxb` (bot), or both `xoxc`/`xoxd` tokens for authentication.
 
+### Liveness probe
+
+When running with `-t sse` or `-t http`, the server exposes an unauthenticated `GET /healthz` endpoint on the same host/port. It returns HTTP 200 with a JSON body (`status`, `version`, `build_time`, `commit_hash`) regardless of Slack auth or cache-warmup state — it is a liveness probe only, not a readiness check. The bearer-token middleware (`SLACK_MCP_API_KEY`) is not applied to `/healthz`. For remote deployments, the streamable HTTP transport (`-t http`) is recommended over SSE.
+
 ### Limitations matrix & Cache
 
 | Users Cache        | Channels Cache     | Limitations                                                                                                                                                                                                                                                                                                                  |
