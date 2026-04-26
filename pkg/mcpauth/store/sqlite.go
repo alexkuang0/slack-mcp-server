@@ -337,6 +337,84 @@ func (s *SQLiteStore) LookupByRefresh(ctx context.Context, refreshHash string) (
 	return scanToken(row)
 }
 
+// RotateRefresh atomically deletes the row matching oldRefreshHash and inserts
+// newToken in a single transaction. If the DELETE affects zero rows, the
+// transaction rolls back and returns ErrTokenNotFound — this is the replay
+// defense for refresh-token rotation.
+func (s *SQLiteStore) RotateRefresh(ctx context.Context, oldRefreshHash string, newToken Token) error {
+	if oldRefreshHash == "" {
+		return ErrTokenNotFound
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("mcpauth/store: begin rotate tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx,
+		`DELETE FROM oauth_tokens WHERE refresh_token_hash = ?`, oldRefreshHash)
+	if err != nil {
+		return fmt.Errorf("mcpauth/store: rotate delete: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mcpauth/store: rotate rows affected: %w", err)
+	}
+	if n != 1 {
+		return ErrTokenNotFound
+	}
+
+	var refreshHash any
+	if newToken.RefreshTokenHash != "" {
+		refreshHash = newToken.RefreshTokenHash
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO oauth_tokens (
+			token_hash, client_id, slack_team_id, slack_user_id,
+			slack_access_token_enc, slack_refresh_token_enc, slack_scope,
+			expires_at, refresh_token_hash
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		newToken.TokenHash, newToken.ClientID, newToken.SlackTeamID, newToken.SlackUserID,
+		newToken.SlackAccessTokenEnc, newToken.SlackRefreshTokenEnc, newToken.SlackScope,
+		newToken.ExpiresAt.UTC(), refreshHash,
+	); err != nil {
+		return fmt.Errorf("mcpauth/store: rotate insert: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("mcpauth/store: rotate commit: %w", err)
+	}
+	return nil
+}
+
+// UpdateSlackTokens replaces the encrypted Slack tokens on an existing MCP
+// token row. Used by the upstream-Slack refresh path so an MCP session can
+// keep working when its xoxp expires. The MCP-side expires_at is intentionally
+// NOT modified here — that column is the MCP access token's own lifetime, not
+// the upstream Slack token's. The expiresAt parameter is reserved for future
+// use (e.g. tracking upstream expiry in a separate column).
+func (s *SQLiteStore) UpdateSlackTokens(ctx context.Context, tokenHash string, accessEnc, refreshEnc []byte, scope string, expiresAt time.Time) error {
+	_ = expiresAt
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE oauth_tokens
+		SET slack_access_token_enc = ?,
+		    slack_refresh_token_enc = ?,
+		    slack_scope = ?
+		WHERE token_hash = ?
+	`, accessEnc, refreshEnc, scope, tokenHash)
+	if err != nil {
+		return fmt.Errorf("mcpauth/store: update slack tokens: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mcpauth/store: rows affected: %w", err)
+	}
+	if n == 0 {
+		return ErrTokenNotFound
+	}
+	return nil
+}
+
 func scanToken(row *sql.Row) (*Token, error) {
 	var (
 		t           Token

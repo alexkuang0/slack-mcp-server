@@ -97,6 +97,17 @@ type Storage interface {
 	// token row. Used by the refresh_token grant.
 	LookupByRefresh(ctx context.Context, refreshHash string) (*Token, error)
 
+	// RotateRefresh atomically deletes the old token (by raw refresh hash)
+	// and inserts the new one. Returns ErrTokenNotFound if the old hash is
+	// absent (defends against replay). Both rows must share the same
+	// client_id; the caller is responsible for that contract.
+	RotateRefresh(ctx context.Context, oldRefreshHash string, newToken Token) error
+
+	// UpdateSlackTokens replaces the encrypted Slack access/refresh tokens
+	// (and scope/expiry) on an existing MCP token row identified by
+	// tokenHash. Returns ErrTokenNotFound if the row does not exist.
+	UpdateSlackTokens(ctx context.Context, tokenHash string, accessEnc, refreshEnc []byte, scope string, expiresAt time.Time) error
+
 	// Slack app credentials.
 	UpsertSlackApp(ctx context.Context, app SlackApp) error
 	GetSlackApp(ctx context.Context, teamID string) (*SlackApp, error)

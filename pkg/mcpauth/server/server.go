@@ -10,7 +10,9 @@ package server
 
 import (
 	"context"
+	"expvar"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +22,11 @@ import (
 	"github.com/korotovsky/slack-mcp-server/pkg/provider"
 	"go.uber.org/zap"
 )
+
+// metricsEnvVar gates the optional unauthenticated /metrics endpoint. When
+// "true", Mount publishes expvar.Handler() at /metrics. Operators MUST keep
+// the endpoint behind a network policy or reverse proxy.
+const metricsEnvVar = "SLACK_MCP_OAUTH_METRICS"
 
 // Default TTLs. Operators can override via the Server struct fields.
 const (
@@ -77,7 +84,14 @@ func (s *Server) Mount(mux *http.ServeMux, mcpHandler http.Handler) {
 	mux.HandleFunc("/authorize", s.handleAuthorize)
 	mux.HandleFunc("/oauth/slack/callback", s.handleSlackCallback)
 	mux.HandleFunc("/token", s.handleToken)
+	mux.HandleFunc("/revoke", s.handleRevoke)
 	mux.Handle("/mcp", s.bearerMiddleware(mcpHandler))
+
+	// Optional, unauthenticated /metrics endpoint (expvar). Off by default;
+	// set SLACK_MCP_OAUTH_METRICS=true to expose. Must be firewalled.
+	if strings.EqualFold(os.Getenv(metricsEnvVar), "true") {
+		mux.Handle("/metrics", expvar.Handler())
+	}
 
 	s.startGCOnce()
 }

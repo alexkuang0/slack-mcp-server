@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/korotovsky/slack-mcp-server/pkg/mcpauth"
 	"go.uber.org/zap"
 )
 
@@ -36,6 +37,9 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// Counter increments on entry regardless of outcome — useful for spotting
+	// flood patterns even when most requests get rejected.
+	mcpauth.IncMetric(mcpauth.MetricAuthorizeRequestsTotal)
 
 	q := r.URL.Query()
 

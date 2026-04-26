@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/korotovsky/slack-mcp-server/pkg/mcpauth"
 	"github.com/korotovsky/slack-mcp-server/pkg/mcpauth/store"
 	"go.uber.org/zap"
 )
@@ -90,6 +91,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		ClientName:              req.ClientName,
 		TokenEndpointAuthMethod: "none",
 	})
+	mcpauth.IncMetric(mcpauth.MetricDCRRegistrationsTotal)
 }
 
 // validateRedirectURI accepts only https or http://localhost (or 127.0.0.1)

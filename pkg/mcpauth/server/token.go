@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -12,15 +13,15 @@ import (
 
 // tokenResponse is the OAuth 2.1 token endpoint response shape we emit.
 type tokenResponse struct {
-	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"`
-	ExpiresIn   int64  `json:"expires_in"`
-	Scope       string `json:"scope,omitempty"`
+	AccessToken  string `json:"access_token"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int64  `json:"expires_in"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	Scope        string `json:"scope,omitempty"`
 }
 
-// handleToken implements POST /token for grant_type=authorization_code (Phase
-// 5). The refresh_token grant lands in Phase 6 — we surface a clear error for
-// it here rather than silently returning invalid_grant.
+// handleToken implements POST /token for both the authorization_code and
+// refresh_token grants per OAuth 2.1.
 func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
@@ -30,6 +31,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 
 	if err := r.ParseForm(); err != nil {
 		writeTokenError(w, http.StatusBadRequest, "invalid_request", "could not parse body")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
 		return
 	}
 
@@ -38,13 +40,11 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	case "authorization_code":
 		s.handleAuthorizationCodeGrant(w, r)
 	case "refresh_token":
-		// Reserved for Phase 6. Avoid leaking that we know about it via
-		// invalid_grant; "unsupported_grant_type" is the correct OAuth code.
-		writeTokenError(w, http.StatusBadRequest, "unsupported_grant_type",
-			"refresh_token grant is not yet implemented")
+		s.handleRefreshTokenGrant(w, r)
 	default:
 		writeTokenError(w, http.StatusBadRequest, "unsupported_grant_type",
 			"unsupported grant_type")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
 	}
 }
 
@@ -59,6 +59,7 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 	if rawCode == "" || redirectURI == "" || clientID == "" || codeVerifier == "" || resource == "" {
 		writeTokenError(w, http.StatusBadRequest, "invalid_request",
 			"code, redirect_uri, client_id, code_verifier, resource are all required")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
 		return
 	}
 
@@ -68,30 +69,34 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 			zap.String("context", "http"),
 			zap.Error(err),
 		)
-		// Whether missing, already-consumed, or anything else, the OAuth
-		// answer is the same: invalid_grant.
 		writeTokenError(w, http.StatusBadRequest, "invalid_grant", "code is invalid or already used")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
 		return
 	}
 
 	if authz.ExpiresAt.Before(s.now()) {
 		writeTokenError(w, http.StatusBadRequest, "invalid_grant", "code expired")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
 		return
 	}
 	if authz.ClientID != clientID {
 		writeTokenError(w, http.StatusBadRequest, "invalid_grant", "client mismatch")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
 		return
 	}
 	if authz.RedirectURI != redirectURI {
 		writeTokenError(w, http.StatusBadRequest, "invalid_grant", "redirect_uri mismatch")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
 		return
 	}
 	if authz.Resource != resource {
 		writeTokenError(w, http.StatusBadRequest, "invalid_grant", "resource mismatch")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
 		return
 	}
 	if !mcpauth.ValidatePKCE(authz.CodeChallenge, codeVerifier) {
 		writeTokenError(w, http.StatusBadRequest, "invalid_grant", "PKCE verifier mismatch")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
 		return
 	}
 
@@ -102,6 +107,18 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 			zap.Error(err),
 		)
 		writeTokenError(w, http.StatusInternalServerError, "server_error", "")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
+		return
+	}
+
+	rawRefresh, refreshHash, err := mcpauth.NewOpaqueToken(mcpauth.MCPRefreshPrefix)
+	if err != nil {
+		s.Logger.Error("mcpauth/token: gen refresh token",
+			zap.String("context", "http"),
+			zap.Error(err),
+		)
+		writeTokenError(w, http.StatusInternalServerError, "server_error", "")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
 		return
 	}
 
@@ -114,6 +131,7 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 		SlackRefreshTokenEnc: authz.SlackRefreshTokenEnc,
 		SlackScope:           authz.SlackScope,
 		ExpiresAt:            s.now().Add(s.AccessTTL),
+		RefreshTokenHash:     refreshHash,
 	}
 	if err := s.Store.CreateToken(r.Context(), tok); err != nil {
 		s.Logger.Error("mcpauth/token: persist token",
@@ -121,16 +139,119 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 			zap.Error(err),
 		)
 		writeTokenError(w, http.StatusInternalServerError, "server_error", "")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
 		return
 	}
 
 	resp := tokenResponse{
-		AccessToken: rawAccess,
-		TokenType:   "Bearer",
-		ExpiresIn:   int64(s.AccessTTL.Seconds()),
-		Scope:       authz.SlackScope,
+		AccessToken:  rawAccess,
+		TokenType:    "Bearer",
+		ExpiresIn:    int64(s.AccessTTL.Seconds()),
+		RefreshToken: rawRefresh,
+		Scope:        authz.SlackScope,
 	}
 
+	writeTokenJSON(w, resp)
+	mcpauth.IncMetric(mcpauth.MetricTokensIssuedTotal)
+}
+
+// handleRefreshTokenGrant rotates an MCP refresh token per OAuth 2.1: the old
+// refresh token is consumed (deleted) and a new (access, refresh) pair is
+// issued, all in a single SQL transaction so a replay attempt sees the row
+// already gone.
+func (s *Server) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request) {
+	form := r.Form
+	refreshRaw := form.Get("refresh_token")
+	clientID := form.Get("client_id")
+
+	if refreshRaw == "" || clientID == "" {
+		writeTokenError(w, http.StatusBadRequest, "invalid_request",
+			"refresh_token and client_id are required")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
+		return
+	}
+
+	oldHash := mcpauth.HashToken(refreshRaw)
+	prev, err := s.Store.LookupByRefresh(r.Context(), oldHash)
+	if err != nil {
+		s.Logger.Warn("mcpauth/token: refresh lookup failed",
+			zap.String("context", "http"),
+			zap.Error(err),
+		)
+		writeTokenError(w, http.StatusBadRequest, "invalid_grant",
+			"refresh_token is invalid or expired")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
+		return
+	}
+	if prev.ClientID != clientID {
+		writeTokenError(w, http.StatusBadRequest, "invalid_grant", "client mismatch")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
+		return
+	}
+
+	rawAccess, accessHash, err := mcpauth.NewOpaqueToken(mcpauth.MCPTokenPrefix)
+	if err != nil {
+		s.Logger.Error("mcpauth/token: gen access token",
+			zap.String("context", "http"),
+			zap.Error(err),
+		)
+		writeTokenError(w, http.StatusInternalServerError, "server_error", "")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
+		return
+	}
+	rawRefresh, refreshHash, err := mcpauth.NewOpaqueToken(mcpauth.MCPRefreshPrefix)
+	if err != nil {
+		s.Logger.Error("mcpauth/token: gen refresh token",
+			zap.String("context", "http"),
+			zap.Error(err),
+		)
+		writeTokenError(w, http.StatusInternalServerError, "server_error", "")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
+		return
+	}
+
+	newTok := store.Token{
+		TokenHash:            accessHash,
+		ClientID:             prev.ClientID,
+		SlackTeamID:          prev.SlackTeamID,
+		SlackUserID:          prev.SlackUserID,
+		SlackAccessTokenEnc:  prev.SlackAccessTokenEnc,
+		SlackRefreshTokenEnc: prev.SlackRefreshTokenEnc,
+		SlackScope:           prev.SlackScope,
+		ExpiresAt:            s.now().Add(s.AccessTTL),
+		RefreshTokenHash:     refreshHash,
+	}
+
+	if err := s.Store.RotateRefresh(r.Context(), oldHash, newTok); err != nil {
+		// ErrTokenNotFound here means the row was already rotated by a concurrent
+		// (or replayed) request between LookupByRefresh and RotateRefresh.
+		if errors.Is(err, store.ErrTokenNotFound) {
+			writeTokenError(w, http.StatusBadRequest, "invalid_grant",
+				"refresh_token is invalid or already used")
+			mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
+			return
+		}
+		s.Logger.Error("mcpauth/token: rotate refresh",
+			zap.String("context", "http"),
+			zap.Error(err),
+		)
+		writeTokenError(w, http.StatusInternalServerError, "server_error", "")
+		mcpauth.IncMetric(mcpauth.MetricTokenGrantFailuresTotal)
+		return
+	}
+
+	resp := tokenResponse{
+		AccessToken:  rawAccess,
+		TokenType:    "Bearer",
+		ExpiresIn:    int64(s.AccessTTL.Seconds()),
+		RefreshToken: rawRefresh,
+		Scope:        prev.SlackScope,
+	}
+	writeTokenJSON(w, resp)
+	mcpauth.IncMetric(mcpauth.MetricTokensRefreshedTotal)
+}
+
+func writeTokenJSON(w http.ResponseWriter, resp tokenResponse) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")

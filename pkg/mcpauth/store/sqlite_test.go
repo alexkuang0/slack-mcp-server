@@ -258,6 +258,154 @@ func TestUnitSQLiteTokenLookup(t *testing.T) {
 	}
 }
 
+func TestUnitSQLiteRotateRefreshHappy(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+
+	mustCreateClient(t, s, "client-rot-1")
+
+	now := time.Now().UTC()
+	tokA := Token{
+		TokenHash:           "tokA",
+		ClientID:            "client-rot-1",
+		SlackTeamID:         "T1",
+		SlackUserID:         "U1",
+		SlackAccessTokenEnc: []byte{0xA1},
+		SlackScope:          "x",
+		ExpiresAt:           now.Add(time.Hour),
+		RefreshTokenHash:    "R1",
+	}
+	if err := s.CreateToken(ctx, tokA); err != nil {
+		t.Fatalf("CreateToken A: %v", err)
+	}
+
+	tokB := Token{
+		TokenHash:           "tokB",
+		ClientID:            "client-rot-1",
+		SlackTeamID:         "T1",
+		SlackUserID:         "U1",
+		SlackAccessTokenEnc: []byte{0xB2},
+		SlackScope:          "x",
+		ExpiresAt:           now.Add(time.Hour),
+		RefreshTokenHash:    "R2",
+	}
+	if err := s.RotateRefresh(ctx, "R1", tokB); err != nil {
+		t.Fatalf("RotateRefresh: %v", err)
+	}
+
+	if _, err := s.LookupByRefresh(ctx, "R1"); !errors.Is(err, ErrTokenNotFound) {
+		t.Fatalf("expected ErrTokenNotFound for old refresh hash, got %v", err)
+	}
+	got, err := s.LookupByRefresh(ctx, "R2")
+	if err != nil {
+		t.Fatalf("LookupByRefresh new: %v", err)
+	}
+	if got.TokenHash != "tokB" {
+		t.Fatalf("expected tokB, got %+v", got)
+	}
+}
+
+func TestUnitSQLiteRotateRefreshReplayFails(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+
+	mustCreateClient(t, s, "client-rot-2")
+
+	now := time.Now().UTC()
+	tokA := Token{
+		TokenHash:           "tokA2",
+		ClientID:            "client-rot-2",
+		SlackTeamID:         "T1",
+		SlackUserID:         "U1",
+		SlackAccessTokenEnc: []byte{0xA1},
+		SlackScope:          "x",
+		ExpiresAt:           now.Add(time.Hour),
+		RefreshTokenHash:    "R-replay",
+	}
+	if err := s.CreateToken(ctx, tokA); err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+
+	tokB := Token{
+		TokenHash:           "tokB2",
+		ClientID:            "client-rot-2",
+		SlackTeamID:         "T1",
+		SlackUserID:         "U1",
+		SlackAccessTokenEnc: []byte{0xB2},
+		SlackScope:          "x",
+		ExpiresAt:           now.Add(time.Hour),
+		RefreshTokenHash:    "R-replay-new",
+	}
+	if err := s.RotateRefresh(ctx, "R-replay", tokB); err != nil {
+		t.Fatalf("first RotateRefresh: %v", err)
+	}
+
+	tokC := Token{
+		TokenHash:           "tokC2",
+		ClientID:            "client-rot-2",
+		SlackTeamID:         "T1",
+		SlackUserID:         "U1",
+		SlackAccessTokenEnc: []byte{0xC3},
+		SlackScope:          "x",
+		ExpiresAt:           now.Add(time.Hour),
+		RefreshTokenHash:    "R-replay-new-2",
+	}
+	if err := s.RotateRefresh(ctx, "R-replay", tokC); !errors.Is(err, ErrTokenNotFound) {
+		t.Fatalf("expected ErrTokenNotFound on replay, got %v", err)
+	}
+
+	// Sanity: tokC was NOT inserted.
+	if _, err := s.LookupByRefresh(ctx, "R-replay-new-2"); !errors.Is(err, ErrTokenNotFound) {
+		t.Fatalf("expected replay rollback, got %v", err)
+	}
+}
+
+func TestUnitSQLiteUpdateSlackTokens(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+
+	mustCreateClient(t, s, "client-upd-1")
+
+	now := time.Now().UTC()
+	tok := Token{
+		TokenHash:            "tok-upd",
+		ClientID:             "client-upd-1",
+		SlackTeamID:          "T1",
+		SlackUserID:          "U1",
+		SlackAccessTokenEnc:  []byte{0x01},
+		SlackRefreshTokenEnc: []byte{0x02},
+		SlackScope:           "old",
+		ExpiresAt:            now.Add(time.Hour),
+	}
+	if err := s.CreateToken(ctx, tok); err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+
+	if err := s.UpdateSlackTokens(ctx, "tok-upd",
+		[]byte{0xAA, 0xBB}, []byte{0xCC, 0xDD}, "new", now.Add(2*time.Hour),
+	); err != nil {
+		t.Fatalf("UpdateSlackTokens: %v", err)
+	}
+
+	got, err := s.LookupToken(ctx, "tok-upd")
+	if err != nil {
+		t.Fatalf("LookupToken: %v", err)
+	}
+	if len(got.SlackAccessTokenEnc) != 2 || got.SlackAccessTokenEnc[0] != 0xAA {
+		t.Fatalf("access not updated: %v", got.SlackAccessTokenEnc)
+	}
+	if len(got.SlackRefreshTokenEnc) != 2 || got.SlackRefreshTokenEnc[0] != 0xCC {
+		t.Fatalf("refresh not updated: %v", got.SlackRefreshTokenEnc)
+	}
+	if got.SlackScope != "new" {
+		t.Fatalf("scope not updated: %q", got.SlackScope)
+	}
+
+	if err := s.UpdateSlackTokens(ctx, "missing", []byte{0x01}, nil, "z", now); !errors.Is(err, ErrTokenNotFound) {
+		t.Fatalf("expected ErrTokenNotFound, got %v", err)
+	}
+}
+
 func TestUnitSQLiteSlackAppUpsert(t *testing.T) {
 	s, _ := newStore(t)
 	ctx := context.Background()

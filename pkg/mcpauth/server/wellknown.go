@@ -41,6 +41,7 @@ func (s *Server) handleAuthorizationServerMetadata(w http.ResponseWriter, r *htt
 		"authorization_endpoint":                s.Issuer + "/authorize",
 		"token_endpoint":                        s.Issuer + "/token",
 		"registration_endpoint":                 s.Issuer + "/register",
+		"revocation_endpoint":                   s.Issuer + "/revoke",
 		"code_challenge_methods_supported":      []string{"S256"},
 		"grant_types_supported":                 []string{"authorization_code", "refresh_token"},
 		"response_types_supported":              []string{"code"},

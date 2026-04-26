@@ -207,8 +207,16 @@ func noRedirectClient() *http.Client {
 }
 
 // driveAuthCodeFlow runs the full happy-path: register → authorize → callback
-// → token, returning the final access_token + the verifier used.
+// → token, returning the final access_token + the verifier used. The
+// refresh_token returned by /token is exposed via driveAuthCodeFlowFull when
+// callers need it.
 func (h *harness) driveAuthCodeFlow(t *testing.T, clientRedirect string) (clientID, verifier, accessToken string) {
+	t.Helper()
+	cid, ver, access, _ := h.driveAuthCodeFlowFull(t, clientRedirect)
+	return cid, ver, access
+}
+
+func (h *harness) driveAuthCodeFlowFull(t *testing.T, clientRedirect string) (clientID, verifier, accessToken, refreshToken string) {
 	t.Helper()
 
 	clientID = h.registerTestClient(t, []string{clientRedirect})
@@ -310,7 +318,7 @@ func (h *harness) driveAuthCodeFlow(t *testing.T, clientRedirect string) (client
 	if tr.ExpiresIn != int64(time.Hour.Seconds()) {
 		t.Fatalf("expires_in: %d", tr.ExpiresIn)
 	}
-	return clientID, verifier, tr.AccessToken
+	return clientID, verifier, tr.AccessToken, tr.RefreshToken
 }
 
 // ----- tests -----------------------------------------------------------------
@@ -528,7 +536,10 @@ func TestUnitFullAuthCodeFlowEndToEnd(t *testing.T) {
 	h := newHarness(t)
 	clientRedirect := "https://app.example.com/cb"
 
-	_, _, access := h.driveAuthCodeFlow(t, clientRedirect)
+	_, _, access, refresh := h.driveAuthCodeFlowFull(t, clientRedirect)
+	if !strings.HasPrefix(refresh, mcpauth.MCPRefreshPrefix) {
+		t.Fatalf("expected refresh_token with %q prefix, got %q", mcpauth.MCPRefreshPrefix, refresh)
+	}
 
 	// Use the bearer to call /mcp; stub handler echoes the tenant.
 	req, err := http.NewRequest(http.MethodGet, h.httpSrv.URL+"/mcp", nil)
@@ -851,6 +862,342 @@ func mustQueryParam(t *testing.T, raw, name string) string {
 		t.Fatalf("query param %q missing in %q", name, raw)
 	}
 	return v
+}
+
+// ----- Phase 6: refresh, revoke, metrics ------------------------------------
+
+func postForm(t *testing.T, url string, form url.Values) *http.Response {
+	t.Helper()
+	resp, err := http.Post(url, "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	return resp
+}
+
+func TestUnitRefreshTokenGrantHappy(t *testing.T) {
+	h := newHarness(t)
+	clientRedirect := "https://app.example.com/cb"
+
+	cid, _, access, refresh := h.driveAuthCodeFlowFull(t, clientRedirect)
+	if refresh == "" {
+		t.Fatalf("expected refresh token from auth_code grant")
+	}
+
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", refresh)
+	form.Set("client_id", cid)
+
+	resp := postForm(t, h.httpSrv.URL+"/token", form)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("refresh status %d: %s", resp.StatusCode, raw)
+	}
+	var tr tokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.HasPrefix(tr.AccessToken, mcpauth.MCPTokenPrefix) {
+		t.Fatalf("new access_token: %q", tr.AccessToken)
+	}
+	if !strings.HasPrefix(tr.RefreshToken, mcpauth.MCPRefreshPrefix) {
+		t.Fatalf("new refresh_token: %q", tr.RefreshToken)
+	}
+	if tr.AccessToken == access {
+		t.Fatalf("expected new access token to differ from prior")
+	}
+	if tr.RefreshToken == refresh {
+		t.Fatalf("expected refresh token rotation")
+	}
+
+	// Old refresh hash must no longer be redeemable (rotation).
+	form2 := url.Values{}
+	form2.Set("grant_type", "refresh_token")
+	form2.Set("refresh_token", refresh)
+	form2.Set("client_id", cid)
+	resp2 := postForm(t, h.httpSrv.URL+"/token", form2)
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 on replay, got %d", resp2.StatusCode)
+	}
+
+	// New access token works at /mcp.
+	req, _ := http.NewRequest(http.MethodGet, h.httpSrv.URL+"/mcp", nil)
+	req.Header.Set("Authorization", "Bearer "+tr.AccessToken)
+	mcpResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("/mcp: %v", err)
+	}
+	defer mcpResp.Body.Close()
+	if mcpResp.StatusCode != http.StatusOK {
+		t.Fatalf("/mcp via new access status %d", mcpResp.StatusCode)
+	}
+}
+
+func TestUnitRefreshTokenGrantClientMismatch(t *testing.T) {
+	h := newHarness(t)
+	clientRedirect := "https://app.example.com/cb"
+
+	_, _, _, refresh := h.driveAuthCodeFlowFull(t, clientRedirect)
+
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", refresh)
+	form.Set("client_id", "mcp_client_someoneelse")
+
+	resp := postForm(t, h.httpSrv.URL+"/token", form)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if out["error"] != "invalid_grant" {
+		t.Errorf("error: %v", out["error"])
+	}
+}
+
+func TestUnitRefreshTokenGrantReplayFails(t *testing.T) {
+	h := newHarness(t)
+	clientRedirect := "https://app.example.com/cb"
+
+	cid, _, _, refresh := h.driveAuthCodeFlowFull(t, clientRedirect)
+
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", refresh)
+	form.Set("client_id", cid)
+
+	first := postForm(t, h.httpSrv.URL+"/token", form)
+	first.Body.Close()
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first refresh status %d", first.StatusCode)
+	}
+
+	second := postForm(t, h.httpSrv.URL+"/token", form)
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusBadRequest {
+		t.Fatalf("second refresh status %d (want 400)", second.StatusCode)
+	}
+}
+
+func TestUnitRevokeAccessTokenSucceeds(t *testing.T) {
+	h := newHarness(t)
+	clientRedirect := "https://app.example.com/cb"
+
+	_, _, access, _ := h.driveAuthCodeFlowFull(t, clientRedirect)
+
+	form := url.Values{}
+	form.Set("token", access)
+	form.Set("token_type_hint", "access_token")
+
+	resp := postForm(t, h.httpSrv.URL+"/revoke", form)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("revoke status %d", resp.StatusCode)
+	}
+
+	// Bearer middleware should now reject.
+	req, _ := http.NewRequest(http.MethodGet, h.httpSrv.URL+"/mcp", nil)
+	req.Header.Set("Authorization", "Bearer "+access)
+	mcpResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("/mcp: %v", err)
+	}
+	defer mcpResp.Body.Close()
+	if mcpResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 after revoke, got %d", mcpResp.StatusCode)
+	}
+}
+
+func TestUnitRevokeRefreshTokenSucceeds(t *testing.T) {
+	h := newHarness(t)
+	clientRedirect := "https://app.example.com/cb"
+
+	cid, _, _, refresh := h.driveAuthCodeFlowFull(t, clientRedirect)
+
+	revForm := url.Values{}
+	revForm.Set("token", refresh)
+	revForm.Set("token_type_hint", "refresh_token")
+	resp := postForm(t, h.httpSrv.URL+"/revoke", revForm)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("revoke status %d", resp.StatusCode)
+	}
+
+	// Refresh grant now fails.
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", refresh)
+	form.Set("client_id", cid)
+	tokResp := postForm(t, h.httpSrv.URL+"/token", form)
+	defer tokResp.Body.Close()
+	if tokResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 after refresh revocation, got %d", tokResp.StatusCode)
+	}
+}
+
+func TestUnitRevokeUnknownTokenStill200(t *testing.T) {
+	h := newHarness(t)
+
+	form := url.Values{}
+	form.Set("token", "mcp_at_definitely-not-a-real-token")
+
+	resp := postForm(t, h.httpSrv.URL+"/revoke", form)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for unknown token (RFC 7009), got %d", resp.StatusCode)
+	}
+}
+
+func TestUnitMetricsCountersIncrement(t *testing.T) {
+	mcpauth.ResetMetricsForTest()
+
+	h := newHarness(t)
+	clientRedirect := "https://app.example.com/cb"
+
+	// Drive a full auth_code flow → /token success bumps tokens_issued_total.
+	h.driveAuthCodeFlow(t, clientRedirect)
+
+	got := mcpauth.Metrics().Get(mcpauth.MetricTokensIssuedTotal).String()
+	if got != "1" {
+		t.Fatalf("tokens_issued_total expected 1, got %q", got)
+	}
+
+	// Sanity: dcr_registrations_total bumped at least once during the flow.
+	if mcpauth.Metrics().Get(mcpauth.MetricDCRRegistrationsTotal).String() == "0" {
+		t.Fatalf("dcr_registrations_total expected >=1, got 0")
+	}
+}
+
+func TestUnitWellKnownIncludesRevocationEndpoint(t *testing.T) {
+	h := newHarness(t)
+	resp, err := http.Get(h.httpSrv.URL + "/.well-known/oauth-authorization-server")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	var as map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&as); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := h.srv.Issuer + "/revoke"
+	if as["revocation_endpoint"] != want {
+		t.Fatalf("revocation_endpoint: %v (want %s)", as["revocation_endpoint"], want)
+	}
+}
+
+func TestUnitRefreshSlackTokenForToken(t *testing.T) {
+	// We need a Slack stub that returns a NEW access token from the refresh
+	// endpoint. The default newFakeSlackForServer returns a fixed token — drive
+	// a custom mux here so we can swap behaviors.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/oauth.v2.access", func(w http.ResponseWriter, r *http.Request) {
+		// Always return a refreshed grant; tests don't need branch behavior.
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":         true,
+			"app_id":     "A1",
+			"token_type": "user",
+			"team":       map[string]string{"id": "TWORKSPACE"},
+			"authed_user": map[string]any{
+				"id":            "UALICE",
+				"scope":         "channels:history",
+				"access_token":  "xoxp-alice-NEW",
+				"refresh_token": "xoxe-alice-NEW",
+				"expires_in":    3600,
+				"token_type":    "user",
+			},
+		})
+	})
+	stub := httptest.NewServer(mux)
+	t.Cleanup(stub.Close)
+
+	storage, err := store.OpenSQLite(context.Background(), "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+
+	masterKey := make([]byte, 32)
+	if _, err := rand.Read(masterKey); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	crypto, err := mcpauth.NewCrypto(masterKey)
+	if err != nil {
+		t.Fatalf("crypto: %v", err)
+	}
+
+	srv := &Server{
+		Logger: zap.NewNop(),
+		Store:  storage,
+		Crypto: crypto,
+		SlackOAuth: &mcpauth.SlackOAuthConfig{
+			ClientID:     "id",
+			ClientSecret: "secret",
+			APIBase:      stub.URL,
+			HTTPClient:   stub.Client(),
+		},
+		Issuer:    "https://test.example",
+		AccessTTL: time.Hour,
+	}
+
+	if err := storage.CreateClient(context.Background(), store.OAuthClient{
+		ClientID:     "client-refresh-test",
+		ClientName:   "rt-test",
+		RedirectURIs: []string{"https://app/cb"},
+		CreatedAt:    time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("client: %v", err)
+	}
+
+	oldRefreshEnc, err := crypto.Encrypt([]byte("xoxe-alice-OLD"))
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	oldAccessEnc, err := crypto.Encrypt([]byte("xoxp-alice-OLD"))
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+
+	tok := store.Token{
+		TokenHash:            "tokhash-refresh",
+		ClientID:             "client-refresh-test",
+		SlackTeamID:          "TWORKSPACE",
+		SlackUserID:          "UALICE",
+		SlackAccessTokenEnc:  oldAccessEnc,
+		SlackRefreshTokenEnc: oldRefreshEnc,
+		SlackScope:           "channels:history",
+		ExpiresAt:            time.Now().UTC().Add(time.Hour),
+	}
+	if err := storage.CreateToken(context.Background(), tok); err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+
+	if err := srv.refreshSlackTokenForToken(context.Background(), "tokhash-refresh"); err != nil {
+		t.Fatalf("refreshSlackTokenForToken: %v", err)
+	}
+
+	got, err := storage.LookupToken(context.Background(), "tokhash-refresh")
+	if err != nil {
+		t.Fatalf("LookupToken: %v", err)
+	}
+	pt, err := crypto.Decrypt(got.SlackAccessTokenEnc)
+	if err != nil {
+		t.Fatalf("decrypt: %v", err)
+	}
+	if string(pt) != "xoxp-alice-NEW" {
+		t.Fatalf("expected updated access token, got %q", string(pt))
+	}
+	rfPT, err := crypto.Decrypt(got.SlackRefreshTokenEnc)
+	if err != nil {
+		t.Fatalf("decrypt refresh: %v", err)
+	}
+	if string(rfPT) != "xoxe-alice-NEW" {
+		t.Fatalf("expected updated refresh token, got %q", string(rfPT))
+	}
 }
 
 // silence "declared and not used" under some build tags.
