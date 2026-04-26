@@ -68,7 +68,12 @@ func main() {
 	}
 
 	p := provider.New(transport, logger)
-	s := server.NewMCPServer(p, logger, enabledTools)
+	// Wrap the singleton provider in a Factory so handlers always go through
+	// the per-tenant indirection. In legacy single-tenant mode this is a
+	// thin pass-through. Multi-tenant transports (Phase 5+) will replace
+	// this with NewMultiTenantFactory.
+	factory := provider.NewLegacyFactory(p)
+	s := server.NewMCPServer(factory, logger, enabledTools)
 
 	go func() {
 		var once sync.Once

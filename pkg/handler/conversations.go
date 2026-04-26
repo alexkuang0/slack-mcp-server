@@ -129,35 +129,48 @@ type markParams struct {
 	ts      string
 }
 type ConversationsHandler struct {
-	apiProvider *provider.ApiProvider
-	logger      *zap.Logger
+	factory provider.Factory
+	logger  *zap.Logger
 }
 
-func NewConversationsHandler(apiProvider *provider.ApiProvider, logger *zap.Logger) *ConversationsHandler {
+func NewConversationsHandler(factory provider.Factory, logger *zap.Logger) *ConversationsHandler {
 	return &ConversationsHandler{
-		apiProvider: apiProvider,
-		logger:      logger,
+		factory: factory,
+		logger:  logger,
 	}
+}
+
+// providerFor resolves the *provider.ApiProvider for the request's tenant.
+// In legacy single-tenant mode it returns the singleton; in multi-tenant mode
+// it returns the per-tenant provider attached to ctx.
+func (ch *ConversationsHandler) providerFor(ctx context.Context) (*provider.ApiProvider, error) {
+	return provider.ProviderFromContext(ctx, ch.factory)
 }
 
 // UsersResource streams a CSV of all users
 func (ch *ConversationsHandler) UsersResource(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 	ch.logger.Debug("UsersResource called", zap.Any("params", request.Params))
 
+	apiProvider, err := ch.providerFor(ctx)
+	if err != nil {
+		ch.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
+
 	// authentication
-	if authenticated, err := auth.IsAuthenticated(ctx, ch.apiProvider.ServerTransport(), ch.logger); !authenticated {
+	if authenticated, err := auth.IsAuthenticated(ctx, apiProvider.ServerTransport(), ch.logger); !authenticated {
 		ch.logger.Error("Authentication failed for users resource", zap.Error(err))
 		return nil, err
 	}
 
 	// provider readiness
-	if ready, err := ch.apiProvider.IsReady(); !ready {
+	if ready, err := apiProvider.IsReady(); !ready {
 		ch.logger.Error("API provider not ready", zap.Error(err))
 		return nil, err
 	}
 
 	// Slack auth test
-	ar, err := ch.apiProvider.Slack().AuthTest()
+	ar, err := apiProvider.Slack().AuthTest()
 	if err != nil {
 		ch.logger.Error("Slack AuthTest failed", zap.Error(err))
 		return nil, err
@@ -173,7 +186,7 @@ func (ch *ConversationsHandler) UsersResource(ctx context.Context, request mcp.R
 	}
 
 	// collect users
-	usersMaps := ch.apiProvider.ProvideUsersMap()
+	usersMaps := apiProvider.ProvideUsersMap()
 	users := usersMaps.Users
 	usersList := make([]User, 0, len(users))
 	for _, user := range users {
@@ -204,13 +217,19 @@ func (ch *ConversationsHandler) UsersResource(ctx context.Context, request mcp.R
 func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("ConversationsAddMessageHandler called", zap.Any("params", request.Params))
 
+	apiProvider, err := ch.providerFor(ctx)
+	if err != nil {
+		ch.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
+
 	// provider readiness
-	if ready, err := ch.apiProvider.IsReady(); !ready {
+	if ready, err := apiProvider.IsReady(); !ready {
 		ch.logger.Error("API provider not ready", zap.Error(err))
 		return nil, err
 	}
 
-	params, err := ch.parseParamsToolAddMessage(ctx, request)
+	params, err := ch.parseParamsToolAddMessage(ctx, apiProvider, request)
 	if err != nil {
 		ch.logger.Error("Failed to parse add-message params", zap.Error(err))
 		return nil, err
@@ -251,7 +270,7 @@ func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Conte
 		zap.String("thread_ts", params.threadTs),
 		zap.String("content_type", params.contentType),
 	)
-	respChannel, respTimestamp, err := ch.apiProvider.Slack().PostMessageContext(ctx, params.channel, options...)
+	respChannel, respTimestamp, err := apiProvider.Slack().PostMessageContext(ctx, params.channel, options...)
 	if err != nil {
 		ch.logger.Error("Slack PostMessageContext failed", zap.Error(err))
 		return nil, err
@@ -259,7 +278,7 @@ func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Conte
 
 	toolConfig := os.Getenv("SLACK_MCP_ADD_MESSAGE_MARK")
 	if toolConfig == "1" || toolConfig == "true" || toolConfig == "yes" {
-		err := ch.apiProvider.Slack().MarkConversationContext(ctx, params.channel, respTimestamp)
+		err := apiProvider.Slack().MarkConversationContext(ctx, params.channel, respTimestamp)
 		if err != nil {
 			ch.logger.Error("Slack MarkConversationContext failed", zap.Error(err))
 			return nil, err
@@ -274,14 +293,14 @@ func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Conte
 		Latest:    respTimestamp,
 		Inclusive: true,
 	}
-	history, err := ch.apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
+	history, err := apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
 	if err != nil {
 		ch.logger.Error("GetConversationHistoryContext failed", zap.Error(err))
 		return nil, err
 	}
 	ch.logger.Debug("Fetched conversation history", zap.Int("message_count", len(history.Messages)))
 
-	messages := ch.convertMessagesFromHistory(history.Messages, historyParams.ChannelID, false)
+	messages := ch.convertMessagesFromHistory(apiProvider, history.Messages, historyParams.ChannelID, false)
 	return marshalMessagesToCSV(messages)
 }
 
@@ -289,13 +308,19 @@ func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Conte
 func (ch *ConversationsHandler) ReactionsAddHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("ReactionsAddHandler called", zap.Any("params", request.Params))
 
+	apiProvider, err := ch.providerFor(ctx)
+	if err != nil {
+		ch.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
+
 	// provider readiness
-	if ready, err := ch.apiProvider.IsReady(); !ready {
+	if ready, err := apiProvider.IsReady(); !ready {
 		ch.logger.Error("API provider not ready", zap.Error(err))
 		return nil, err
 	}
 
-	params, err := ch.parseParamsToolReaction(ctx, request)
+	params, err := ch.parseParamsToolReaction(ctx, apiProvider, request)
 	if err != nil {
 		ch.logger.Error("Failed to parse add-reaction params", zap.Error(err))
 		return nil, err
@@ -312,7 +337,7 @@ func (ch *ConversationsHandler) ReactionsAddHandler(ctx context.Context, request
 		zap.String("emoji", params.emoji),
 	)
 
-	err = ch.apiProvider.Slack().AddReactionContext(ctx, params.emoji, itemRef)
+	err = apiProvider.Slack().AddReactionContext(ctx, params.emoji, itemRef)
 	if err != nil {
 		ch.logger.Error("Slack AddReactionContext failed", zap.Error(err))
 		return nil, err
@@ -325,13 +350,19 @@ func (ch *ConversationsHandler) ReactionsAddHandler(ctx context.Context, request
 func (ch *ConversationsHandler) ReactionsRemoveHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("ReactionsRemoveHandler called", zap.Any("params", request.Params))
 
+	apiProvider, err := ch.providerFor(ctx)
+	if err != nil {
+		ch.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
+
 	// provider readiness
-	if ready, err := ch.apiProvider.IsReady(); !ready {
+	if ready, err := apiProvider.IsReady(); !ready {
 		ch.logger.Error("API provider not ready", zap.Error(err))
 		return nil, err
 	}
 
-	params, err := ch.parseParamsToolReaction(ctx, request)
+	params, err := ch.parseParamsToolReaction(ctx, apiProvider, request)
 	if err != nil {
 		ch.logger.Error("Failed to parse remove-reaction params", zap.Error(err))
 		return nil, err
@@ -348,7 +379,7 @@ func (ch *ConversationsHandler) ReactionsRemoveHandler(ctx context.Context, requ
 		zap.String("emoji", params.emoji),
 	)
 
-	err = ch.apiProvider.Slack().RemoveReactionContext(ctx, params.emoji, itemRef)
+	err = apiProvider.Slack().RemoveReactionContext(ctx, params.emoji, itemRef)
 	if err != nil {
 		ch.logger.Error("Slack RemoveReactionContext failed", zap.Error(err))
 		return nil, err
@@ -360,7 +391,13 @@ func (ch *ConversationsHandler) ReactionsRemoveHandler(ctx context.Context, requ
 func (ch *ConversationsHandler) UsersSearchHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("UsersSearchHandler called", zap.Any("params", request.Params))
 
-	if ready, err := ch.apiProvider.IsReady(); !ready {
+	apiProvider, err := ch.providerFor(ctx)
+	if err != nil {
+		ch.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
+
+	if ready, err := apiProvider.IsReady(); !ready {
 		ch.logger.Error("API provider not ready", zap.Error(err))
 		return nil, err
 	}
@@ -376,13 +413,13 @@ func (ch *ConversationsHandler) UsersSearchHandler(ctx context.Context, request 
 		zap.Int("limit", params.limit),
 	)
 
-	users, err := ch.apiProvider.SearchUsers(ctx, params.query, params.limit)
+	users, err := apiProvider.SearchUsers(ctx, params.query, params.limit)
 	if err != nil {
 		ch.logger.Error("UsersSearch failed", zap.Error(err))
 		return nil, fmt.Errorf("users search failed: %w", err)
 	}
 
-	channelsMap := ch.apiProvider.ProvideChannelsMaps()
+	channelsMap := apiProvider.ProvideChannelsMaps()
 
 	results := make([]UserSearchResult, 0, len(users))
 	for _, user := range users {
@@ -423,9 +460,14 @@ func (ch *ConversationsHandler) UsersSearchHandler(ctx context.Context, request 
 }
 
 func (ch *ConversationsHandler) FilesGetHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	apiProvider, err := ch.providerFor(ctx)
+	if err != nil {
+		ch.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
 	ch.logger.Debug("FilesGetHandler called", zap.Any("params", request.Params))
 
-	if ready, err := ch.apiProvider.IsReady(); !ready {
+	if ready, err := apiProvider.IsReady(); !ready {
 		ch.logger.Error("API provider not ready", zap.Error(err))
 		return nil, err
 	}
@@ -436,7 +478,7 @@ func (ch *ConversationsHandler) FilesGetHandler(ctx context.Context, request mcp
 		return nil, err
 	}
 
-	fileInfo, _, _, err := ch.apiProvider.Slack().GetFileInfoContext(ctx, params.fileID, 0, 0)
+	fileInfo, _, _, err := apiProvider.Slack().GetFileInfoContext(ctx, params.fileID, 0, 0)
 	if err != nil {
 		ch.logger.Error("Slack GetFileInfoContext failed", zap.Error(err))
 		return nil, err
@@ -455,7 +497,7 @@ func (ch *ConversationsHandler) FilesGetHandler(ctx context.Context, request mcp
 		return nil, errors.New("file has no downloadable URL")
 	}
 
-	err = ch.apiProvider.Slack().GetFileContext(ctx, downloadURL, &buf)
+	err = apiProvider.Slack().GetFileContext(ctx, downloadURL, &buf)
 	if err != nil {
 		ch.logger.Error("Slack GetFileContext failed", zap.Error(err))
 		return nil, err
@@ -510,7 +552,13 @@ func escapeJSON(s string) string {
 func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("ConversationsHistoryHandler called", zap.Any("params", request.Params))
 
-	params, err := ch.parseParamsToolConversations(ctx, request)
+	apiProvider, err := ch.providerFor(ctx)
+	if err != nil {
+		ch.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
+
+	params, err := ch.parseParamsToolConversations(ctx, apiProvider, request)
 	if err != nil {
 		ch.logger.Error("Failed to parse history params", zap.Error(err))
 		return nil, err
@@ -531,7 +579,7 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 		Cursor:    params.cursor,
 		Inclusive: false,
 	}
-	history, err := ch.apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
+	history, err := apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
 	if err != nil {
 		ch.logger.Error("GetConversationHistoryContext failed", zap.Error(err))
 		return nil, err
@@ -539,7 +587,7 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 
 	ch.logger.Debug("Fetched conversation history", zap.Int("message_count", len(history.Messages)))
 
-	messages := ch.convertMessagesFromHistory(history.Messages, params.channel, params.activity)
+	messages := ch.convertMessagesFromHistory(apiProvider, history.Messages, params.channel, params.activity)
 
 	if len(messages) > 0 && history.HasMore {
 		messages[len(messages)-1].Cursor = history.ResponseMetaData.NextCursor
@@ -551,7 +599,13 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 func (ch *ConversationsHandler) ConversationsRepliesHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("ConversationsRepliesHandler called", zap.Any("params", request.Params))
 
-	params, err := ch.parseParamsToolConversations(ctx, request)
+	apiProvider, err := ch.providerFor(ctx)
+	if err != nil {
+		ch.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
+
+	params, err := ch.parseParamsToolConversations(ctx, apiProvider, request)
 	if err != nil {
 		ch.logger.Error("Failed to parse replies params", zap.Error(err))
 		return nil, err
@@ -571,14 +625,14 @@ func (ch *ConversationsHandler) ConversationsRepliesHandler(ctx context.Context,
 		Cursor:    params.cursor,
 		Inclusive: false,
 	}
-	replies, hasMore, nextCursor, err := ch.apiProvider.Slack().GetConversationRepliesContext(ctx, &repliesParams)
+	replies, hasMore, nextCursor, err := apiProvider.Slack().GetConversationRepliesContext(ctx, &repliesParams)
 	if err != nil {
 		ch.logger.Error("GetConversationRepliesContext failed", zap.Error(err))
 		return nil, err
 	}
 	ch.logger.Debug("Fetched conversation replies", zap.Int("count", len(replies)))
 
-	messages := ch.convertMessagesFromHistory(replies, params.channel, params.activity)
+	messages := ch.convertMessagesFromHistory(apiProvider, replies, params.channel, params.activity)
 	if len(messages) > 0 && hasMore {
 		messages[len(messages)-1].Cursor = nextCursor
 	}
@@ -588,7 +642,13 @@ func (ch *ConversationsHandler) ConversationsRepliesHandler(ctx context.Context,
 func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("ConversationsSearchHandler called", zap.Any("params", request.Params))
 
-	params, err := ch.parseParamsToolSearch(request)
+	apiProvider, err := ch.providerFor(ctx)
+	if err != nil {
+		ch.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
+
+	params, err := ch.parseParamsToolSearch(apiProvider, request)
 	if err != nil {
 		ch.logger.Error("Failed to parse search params", zap.Error(err))
 		return nil, err
@@ -602,14 +662,14 @@ func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, 
 		Count:         params.limit,
 		Page:          params.page,
 	}
-	messagesRes, _, err := ch.apiProvider.Slack().SearchContext(ctx, params.query, searchParams)
+	messagesRes, _, err := apiProvider.Slack().SearchContext(ctx, params.query, searchParams)
 	if err != nil {
 		ch.logger.Error("Slack SearchContext failed", zap.Error(err))
 		return nil, err
 	}
 	ch.logger.Debug("Search completed", zap.Int("matches", len(messagesRes.Matches)))
 
-	messages := ch.convertMessagesFromSearch(messagesRes.Matches)
+	messages := ch.convertMessagesFromSearch(apiProvider, messagesRes.Matches)
 	if len(messages) > 0 && messagesRes.Pagination.Page < messagesRes.Pagination.PageCount {
 		nextCursor := fmt.Sprintf("page:%d", messagesRes.Pagination.Page+1)
 		messages[len(messages)-1].Cursor = base64.StdEncoding.EncodeToString([]byte(nextCursor))
@@ -637,11 +697,17 @@ type UnreadMessage struct {
 func (ch *ConversationsHandler) ConversationsUnreadsHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("ConversationsUnreadsHandler called", zap.Any("params", request.Params))
 
+	apiProvider, err := ch.providerFor(ctx)
+	if err != nil {
+		ch.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
+
 	params := ch.parseParamsToolUnreads(request)
 
 	// Fetch muted channels unless the caller wants them included
 	if !params.includeMuted {
-		mutedChannels, err := ch.apiProvider.Slack().GetMutedChannels(ctx)
+		mutedChannels, err := apiProvider.Slack().GetMutedChannels(ctx)
 		if err != nil {
 			ch.logger.Warn("Failed to fetch muted channels, proceeding without mute filter", zap.Error(err))
 			params.mutedUnavailable = true
@@ -655,35 +721,35 @@ func (ch *ConversationsHandler) ConversationsUnreadsHandler(ctx context.Context,
 	// - xoxc/xoxd (browser session): use fast client.counts API
 	// - xoxp (OAuth user): fall back to conversations.info/history approach
 	// - xoxb (bot): not supported — unreads is a user-level concept
-	if ch.apiProvider.IsOAuth() {
-		if ch.apiProvider.IsBotToken() {
+	if apiProvider.IsOAuth() {
+		if apiProvider.IsBotToken() {
 			return nil, fmt.Errorf(
 				"conversations_unreads requires a user token (xoxp) or browser session tokens (xoxc/xoxd); " +
 					"bot tokens (xoxb) do not support unread tracking",
 			)
 		}
 		ch.logger.Info("OAuth token detected, using conversations.info fallback for unreads")
-		return ch.getUnreadsViaConversationsInfo(ctx, params)
+		return ch.getUnreadsViaConversationsInfo(ctx, apiProvider, params)
 	}
 
-	counts, err := ch.apiProvider.Slack().ClientCounts(ctx)
+	counts, err := apiProvider.Slack().ClientCounts(ctx)
 	if err != nil {
 		ch.logger.Error("ClientCounts failed", zap.Error(err))
 		return nil, fmt.Errorf("failed to get client counts: %v", err)
 	}
 
-	return ch.processClientCountsResponse(ctx, params, counts)
+	return ch.processClientCountsResponse(ctx, apiProvider, params, counts)
 }
 
-func (ch *ConversationsHandler) processClientCountsResponse(ctx context.Context, params *unreadsParams, counts edge.ClientCountsResponse) (*mcp.CallToolResult, error) {
+func (ch *ConversationsHandler) processClientCountsResponse(ctx context.Context, apiProvider *provider.ApiProvider, params *unreadsParams, counts edge.ClientCountsResponse) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("Got counts data",
 		zap.Int("channels", len(counts.Channels)),
 		zap.Int("mpims", len(counts.MPIMs)),
 		zap.Int("ims", len(counts.IMs)))
 
 	// Get users map and channels map for resolving names
-	usersMap := ch.apiProvider.ProvideUsersMap()
-	channelsMaps := ch.apiProvider.ProvideChannelsMaps()
+	usersMap := apiProvider.ProvideUsersMap()
+	channelsMaps := apiProvider.ProvideChannelsMaps()
 
 	// Collect channels with unreads
 	var unreadChannels []UnreadChannel
@@ -846,7 +912,7 @@ func (ch *ConversationsHandler) processClientCountsResponse(ctx context.Context,
 			backfilled++
 			continue
 		}
-		history, err := ch.apiProvider.Slack().GetConversationHistoryContext(ctx,
+		history, err := apiProvider.Slack().GetConversationHistoryContext(ctx,
 			&slack.GetConversationHistoryParameters{
 				ChannelID: unreadChannels[i].ChannelID,
 				Oldest:    unreadChannels[i].LastRead,
@@ -885,7 +951,7 @@ func (ch *ConversationsHandler) processClientCountsResponse(ctx context.Context,
 			Inclusive: false,
 		}
 
-		history, err := ch.apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
+		history, err := apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
 		if err != nil {
 			ch.logger.Warn("Failed to get history for channel",
 				zap.String("channel", unreadChannels[i].ChannelID),
@@ -897,7 +963,7 @@ func (ch *ConversationsHandler) processClientCountsResponse(ctx context.Context,
 		unreadChannels[i].UnreadCount = len(history.Messages)
 
 		// Convert messages
-		channelMessages := ch.convertMessagesFromHistory(history.Messages, unreadChannels[i].ChannelName, false)
+		channelMessages := ch.convertMessagesFromHistory(apiProvider, history.Messages, unreadChannels[i].ChannelName, false)
 		allMessages = append(allMessages, channelMessages...)
 	}
 
@@ -906,8 +972,8 @@ func (ch *ConversationsHandler) processClientCountsResponse(ctx context.Context,
 	return marshalMessagesToCSV(allMessages)
 }
 
-func (ch *ConversationsHandler) getUnreadsViaConversationsInfo(ctx context.Context, params *unreadsParams) (*mcp.CallToolResult, error) {
-	usersMap := ch.apiProvider.ProvideUsersMap()
+func (ch *ConversationsHandler) getUnreadsViaConversationsInfo(ctx context.Context, apiProvider *provider.ApiProvider, params *unreadsParams) (*mcp.CallToolResult, error) {
+	usersMap := apiProvider.ProvideUsersMap()
 
 	// Define channel type groups in priority order.
 	// users.conversations returns channels in creation order (NOT by activity),
@@ -955,7 +1021,7 @@ func (ch *ConversationsHandler) getUnreadsViaConversationsInfo(ctx context.Conte
 			}
 		}
 
-		found, apiCalls, scanned, rateLimited := ch.scanTypeGroupForUnreads(ctx, params, usersMap, group.slackTypes, group.channelType, group.budget, group.isDM)
+		found, apiCalls, scanned, rateLimited := ch.scanTypeGroupForUnreads(ctx, apiProvider, params, usersMap, group.slackTypes, group.channelType, group.budget, group.isDM)
 		unreadChannels = append(unreadChannels, found...)
 		totalAPIcalls += apiCalls
 		totalScanned += scanned
@@ -1014,7 +1080,7 @@ func (ch *ConversationsHandler) getUnreadsViaConversationsInfo(ctx context.Conte
 		}
 
 		history, err := limiter.CallWithRetry(ctx, rl, 2, slackRetryAfter, func() (*slack.GetConversationHistoryResponse, error) {
-			return ch.apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
+			return apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
 		})
 		if err != nil {
 			ch.logger.Warn("Failed to get history for channel",
@@ -1023,7 +1089,7 @@ func (ch *ConversationsHandler) getUnreadsViaConversationsInfo(ctx context.Conte
 			continue
 		}
 
-		channelMessages := ch.convertMessagesFromHistory(history.Messages, uc.ChannelName, false)
+		channelMessages := ch.convertMessagesFromHistory(apiProvider, history.Messages, uc.ChannelName, false)
 		allMessages = append(allMessages, channelMessages...)
 	}
 
@@ -1069,6 +1135,7 @@ func slackRetryAfter(err error) time.Duration {
 // and the number of channels skipped due to rate limiting.
 func (ch *ConversationsHandler) scanTypeGroupForUnreads(
 	ctx context.Context,
+	apiProvider *provider.ApiProvider,
 	params *unreadsParams,
 	usersMap *provider.UsersCache,
 	slackTypes []string,
@@ -1127,7 +1194,7 @@ func (ch *ConversationsHandler) scanTypeGroupForUnreads(
 			Cursor:          cursor,
 		}
 
-		channels, nextCursor, err := ch.apiProvider.Slack().GetConversationsForUserContext(ctx, userConvParams)
+		channels, nextCursor, err := apiProvider.Slack().GetConversationsForUserContext(ctx, userConvParams)
 		apiCalls++
 		if err != nil {
 			ch.logger.Warn("Failed to list conversations for type group",
@@ -1160,7 +1227,7 @@ func (ch *ConversationsHandler) scanTypeGroupForUnreads(
 			// that silently skip channels (see: slack-go does NOT auto-retry
 			// on *RateLimitedError for standard client methods).
 			info, err := limiter.CallWithRetry(ctx, rl, 2, slackRetryAfter, func() (*slack.Channel, error) {
-				return ch.apiProvider.Slack().GetConversationInfoContext(ctx, &slack.GetConversationInfoInput{
+				return apiProvider.Slack().GetConversationInfoContext(ctx, &slack.GetConversationInfoInput{
 					ChannelID: channel.ID,
 				})
 			})
@@ -1221,7 +1288,7 @@ func (ch *ConversationsHandler) scanTypeGroupForUnreads(
 					Inclusive: false,
 				}
 				history, err := limiter.CallWithRetry(ctx, rl, 2, slackRetryAfter, func() (*slack.GetConversationHistoryResponse, error) {
-					return ch.apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
+					return apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
 				})
 				apiCalls++
 				if err != nil {
@@ -1322,7 +1389,13 @@ func (ch *ConversationsHandler) getChannelDisplayName(info *slack.Channel, chann
 func (ch *ConversationsHandler) ConversationsMarkHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("ConversationsMarkHandler called", zap.Any("params", request.Params))
 
-	params, err := ch.parseParamsToolMark(request)
+	apiProvider, err := ch.providerFor(ctx)
+	if err != nil {
+		ch.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
+
+	params, err := ch.parseParamsToolMark(apiProvider, request)
 	if err != nil {
 		ch.logger.Error("Failed to parse mark params", zap.Error(err))
 		return nil, err
@@ -1337,7 +1410,7 @@ func (ch *ConversationsHandler) ConversationsMarkHandler(ctx context.Context, re
 			ChannelID: channel,
 			Limit:     1,
 		}
-		history, err := ch.apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
+		history, err := apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
 		if err != nil {
 			ch.logger.Error("Failed to get latest message", zap.Error(err))
 			return nil, fmt.Errorf("failed to get latest message: %v", err)
@@ -1351,7 +1424,7 @@ func (ch *ConversationsHandler) ConversationsMarkHandler(ctx context.Context, re
 	}
 
 	// Mark the conversation as read
-	err = ch.apiProvider.Slack().MarkConversationContext(ctx, channel, ts)
+	err = apiProvider.Slack().MarkConversationContext(ctx, channel, ts)
 	if err != nil {
 		ch.logger.Error("Failed to mark conversation", zap.Error(err))
 		return nil, fmt.Errorf("failed to mark conversation as read: %v", err)
@@ -1414,13 +1487,13 @@ func isChannelAllowed(channel string) bool {
 	return isChannelAllowedForConfig(channel, os.Getenv("SLACK_MCP_ADD_MESSAGE_TOOL"))
 }
 
-func (ch *ConversationsHandler) resolveChannelID(ctx context.Context, channel string) (string, error) {
+func (ch *ConversationsHandler) resolveChannelID(ctx context.Context, apiProvider *provider.ApiProvider, channel string) (string, error) {
 	if !strings.HasPrefix(channel, "#") && !strings.HasPrefix(channel, "@") {
 		return channel, nil
 	}
 
 	// First attempt: try to resolve from current cache
-	channelsMaps := ch.apiProvider.ProvideChannelsMaps()
+	channelsMaps := apiProvider.ProvideChannelsMaps()
 	chn, ok := channelsMaps.ChannelsInv[channel]
 	if ok {
 		return channelsMaps.Channels[chn].ID, nil
@@ -1430,7 +1503,7 @@ func (ch *ConversationsHandler) resolveChannelID(ctx context.Context, channel st
 	ch.logger.Debug("Channel not found in cache, attempting refresh",
 		zap.String("channel", channel))
 
-	refreshErr := ch.apiProvider.ForceRefreshChannels(ctx)
+	refreshErr := apiProvider.ForceRefreshChannels(ctx)
 	wasRateLimited := errors.Is(refreshErr, provider.ErrRefreshRateLimited)
 
 	if refreshErr != nil && !wasRateLimited {
@@ -1448,7 +1521,7 @@ func (ch *ConversationsHandler) resolveChannelID(ctx context.Context, channel st
 	}
 
 	// Second attempt after successful refresh
-	channelsMaps = ch.apiProvider.ProvideChannelsMaps()
+	channelsMaps = apiProvider.ProvideChannelsMaps()
 	chn, ok = channelsMaps.ChannelsInv[channel]
 	if !ok {
 		ch.logger.Error("Channel not found even after cache refresh",
@@ -1463,8 +1536,8 @@ func (ch *ConversationsHandler) resolveChannelID(ctx context.Context, channel st
 	return channelsMaps.Channels[chn].ID, nil
 }
 
-func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack.Message, channel string, includeActivity bool) []Message {
-	usersMap := ch.apiProvider.ProvideUsersMap()
+func (ch *ConversationsHandler) convertMessagesFromHistory(apiProvider *provider.ApiProvider, slackMessages []slack.Message, channel string, includeActivity bool) []Message {
+	usersMap := apiProvider.ProvideUsersMap()
 	var messages []Message
 	warn := false
 
@@ -1528,7 +1601,7 @@ func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack
 		})
 	}
 
-	if ready, err := ch.apiProvider.IsReady(); !ready {
+	if ready, err := apiProvider.IsReady(); !ready {
 		if warn && errors.Is(err, provider.ErrUsersNotReady) {
 			ch.logger.Warn(
 				"WARNING: Slack users sync is not ready yet, you may experience some limited functionality and see UIDs instead of resolved names as well as unable to query users by their @handles. Users sync is part of channels sync and operations on channels depend on users collection (IM, MPIM). Please wait until users are synced and try again",
@@ -1539,8 +1612,8 @@ func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack
 	return messages
 }
 
-func (ch *ConversationsHandler) convertMessagesFromSearch(slackMessages []slack.SearchMessage) []Message {
-	usersMap := ch.apiProvider.ProvideUsersMap()
+func (ch *ConversationsHandler) convertMessagesFromSearch(apiProvider *provider.ApiProvider, slackMessages []slack.SearchMessage) []Message {
+	usersMap := apiProvider.ProvideUsersMap()
 	var messages []Message
 	warn := false
 
@@ -1579,7 +1652,7 @@ func (ch *ConversationsHandler) convertMessagesFromSearch(slackMessages []slack.
 		})
 	}
 
-	if ready, err := ch.apiProvider.IsReady(); !ready {
+	if ready, err := apiProvider.IsReady(); !ready {
 		if warn && errors.Is(err, provider.ErrUsersNotReady) {
 			ch.logger.Warn(
 				"Slack users sync not ready; you may see raw UIDs instead of names and lose some functionality.",
@@ -1590,7 +1663,7 @@ func (ch *ConversationsHandler) convertMessagesFromSearch(slackMessages []slack.
 	return messages
 }
 
-func (ch *ConversationsHandler) parseParamsToolConversations(ctx context.Context, request mcp.CallToolRequest) (*conversationParams, error) {
+func (ch *ConversationsHandler) parseParamsToolConversations(ctx context.Context, apiProvider *provider.ApiProvider, request mcp.CallToolRequest) (*conversationParams, error) {
 	channel := request.GetString("channel_id", "")
 	if channel == "" {
 		ch.logger.Error("channel_id missing in conversations params")
@@ -1622,7 +1695,7 @@ func (ch *ConversationsHandler) parseParamsToolConversations(ctx context.Context
 	}
 
 	if strings.HasPrefix(channel, "#") || strings.HasPrefix(channel, "@") {
-		if ready, err := ch.apiProvider.IsReady(); !ready {
+		if ready, err := apiProvider.IsReady(); !ready {
 			if errors.Is(err, provider.ErrUsersNotReady) {
 				ch.logger.Warn(
 					"WARNING: Slack users sync is not ready yet, you may experience some limited functionality and see UIDs instead of resolved names as well as unable to query users by their @handles. Users sync is part of channels sync and operations on channels depend on users collection (IM, MPIM). Please wait until users are synced and try again",
@@ -1638,7 +1711,7 @@ func (ch *ConversationsHandler) parseParamsToolConversations(ctx context.Context
 			return nil, fmt.Errorf("channel %q not found in empty cache", channel)
 		}
 		// Use resolveChannelID which includes refresh-on-error logic
-		resolvedChannel, err := ch.resolveChannelID(ctx, channel)
+		resolvedChannel, err := ch.resolveChannelID(ctx, apiProvider, channel)
 		if err != nil {
 			return nil, err
 		}
@@ -1655,7 +1728,7 @@ func (ch *ConversationsHandler) parseParamsToolConversations(ctx context.Context
 	}, nil
 }
 
-func (ch *ConversationsHandler) parseParamsToolAddMessage(ctx context.Context, request mcp.CallToolRequest) (*addMessageParams, error) {
+func (ch *ConversationsHandler) parseParamsToolAddMessage(ctx context.Context, apiProvider *provider.ApiProvider, request mcp.CallToolRequest) (*addMessageParams, error) {
 	toolConfig := os.Getenv("SLACK_MCP_ADD_MESSAGE_TOOL")
 	enabledTools := os.Getenv("SLACK_MCP_ENABLED_TOOLS")
 
@@ -1677,7 +1750,7 @@ func (ch *ConversationsHandler) parseParamsToolAddMessage(ctx context.Context, r
 		ch.logger.Error("channel_id missing in add-message params")
 		return nil, errors.New("channel_id must be a string")
 	}
-	channel, err := ch.resolveChannelID(ctx, channel)
+	channel, err := ch.resolveChannelID(ctx, apiProvider, channel)
 	if err != nil {
 		ch.logger.Error("Channel not found", zap.String("channel", channel), zap.Error(err))
 		return nil, err
@@ -1717,7 +1790,7 @@ func (ch *ConversationsHandler) parseParamsToolAddMessage(ctx context.Context, r
 	}, nil
 }
 
-func (ch *ConversationsHandler) parseParamsToolReaction(ctx context.Context, request mcp.CallToolRequest) (*addReactionParams, error) {
+func (ch *ConversationsHandler) parseParamsToolReaction(ctx context.Context, apiProvider *provider.ApiProvider, request mcp.CallToolRequest) (*addReactionParams, error) {
 	toolConfig := os.Getenv("SLACK_MCP_REACTION_TOOL")
 	enabledTools := os.Getenv("SLACK_MCP_ENABLED_TOOLS")
 
@@ -1738,7 +1811,7 @@ func (ch *ConversationsHandler) parseParamsToolReaction(ctx context.Context, req
 	if channel == "" {
 		return nil, errors.New("channel_id is required")
 	}
-	channel, err := ch.resolveChannelID(ctx, channel)
+	channel, err := ch.resolveChannelID(ctx, apiProvider, channel)
 	if err != nil {
 		ch.logger.Error("Channel not found", zap.String("channel", channel), zap.Error(err))
 		return nil, err
@@ -1825,7 +1898,7 @@ func (ch *ConversationsHandler) parseParamsToolUnreads(request mcp.CallToolReque
 	}
 }
 
-func (ch *ConversationsHandler) parseParamsToolMark(request mcp.CallToolRequest) (*markParams, error) {
+func (ch *ConversationsHandler) parseParamsToolMark(apiProvider *provider.ApiProvider, request mcp.CallToolRequest) (*markParams, error) {
 	toolConfig := os.Getenv("SLACK_MCP_MARK_TOOL")
 	if toolConfig == "" {
 		ch.logger.Error("Mark tool disabled by default")
@@ -1851,7 +1924,7 @@ func (ch *ConversationsHandler) parseParamsToolMark(request mcp.CallToolRequest)
 
 	// Resolve channel name to ID if needed
 	if strings.HasPrefix(channel, "#") || strings.HasPrefix(channel, "@") {
-		channelsMaps := ch.apiProvider.ProvideChannelsMaps()
+		channelsMaps := apiProvider.ProvideChannelsMaps()
 		chn, ok := channelsMaps.ChannelsInv[channel]
 		if !ok {
 			ch.logger.Error("Channel not found", zap.String("channel", channel))
@@ -1867,7 +1940,7 @@ func (ch *ConversationsHandler) parseParamsToolMark(request mcp.CallToolRequest)
 		ts:      ts,
 	}, nil
 }
-func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (*searchParams, error) {
+func (ch *ConversationsHandler) parseParamsToolSearch(apiProvider *provider.ApiProvider, req mcp.CallToolRequest) (*searchParams, error) {
 	rawQuery := strings.TrimSpace(req.GetString("search_query", ""))
 	freeText, filters := splitQuery(rawQuery)
 
@@ -1875,14 +1948,14 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 		addFilter(filters, "is", "thread")
 	}
 	if chName := req.GetString("filter_in_channel", ""); chName != "" {
-		f, err := ch.paramFormatChannel(chName)
+		f, err := ch.paramFormatChannel(apiProvider, chName)
 		if err != nil {
 			ch.logger.Error("Invalid channel filter", zap.String("filter", chName), zap.Error(err))
 			return nil, err
 		}
 		addFilter(filters, "in", f)
 	} else if im := req.GetString("filter_in_im_or_mpim", ""); im != "" {
-		f, err := ch.paramFormatUser(im)
+		f, err := ch.paramFormatUser(apiProvider, im)
 		if err != nil {
 			ch.logger.Error("Invalid IM/MPIM filter", zap.String("filter", im), zap.Error(err))
 			return nil, err
@@ -1890,7 +1963,7 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 		addFilter(filters, "in", f)
 	}
 	if with := req.GetString("filter_users_with", ""); with != "" {
-		f, err := ch.paramFormatUser(with)
+		f, err := ch.paramFormatUser(apiProvider, with)
 		if err != nil {
 			ch.logger.Error("Invalid with-user filter", zap.String("filter", with), zap.Error(err))
 			return nil, err
@@ -1898,7 +1971,7 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 		addFilter(filters, "with", f)
 	}
 	if from := req.GetString("filter_users_from", ""); from != "" {
-		f, err := ch.paramFormatUser(from)
+		f, err := ch.paramFormatUser(apiProvider, from)
 		if err != nil {
 			ch.logger.Error("Invalid from-user filter", zap.String("filter", from), zap.Error(err))
 			return nil, err
@@ -1965,8 +2038,8 @@ func isSlackUserIDPrefix(s string) bool {
 	return strings.HasPrefix(s, "U") || strings.HasPrefix(s, "W")
 }
 
-func (ch *ConversationsHandler) paramFormatUser(raw string) (string, error) {
-	users := ch.apiProvider.ProvideUsersMap()
+func (ch *ConversationsHandler) paramFormatUser(apiProvider *provider.ApiProvider, raw string) (string, error) {
+	users := apiProvider.ProvideUsersMap()
 	raw = strings.TrimSpace(raw)
 	if isSlackUserIDPrefix(raw) {
 		u, ok := users.Users[raw]
@@ -1988,9 +2061,9 @@ func (ch *ConversationsHandler) paramFormatUser(raw string) (string, error) {
 	return fmt.Sprintf("<@%s>", uid), nil
 }
 
-func (ch *ConversationsHandler) paramFormatChannel(raw string) (string, error) {
+func (ch *ConversationsHandler) paramFormatChannel(apiProvider *provider.ApiProvider, raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
-	cms := ch.apiProvider.ProvideChannelsMaps()
+	cms := apiProvider.ProvideChannelsMaps()
 	if strings.HasPrefix(raw, "#") {
 		if id, ok := cms.ChannelsInv[raw]; ok {
 			return cms.Channels[id].Name, nil

@@ -27,14 +27,14 @@ type UserGroup struct {
 }
 
 type UsergroupsHandler struct {
-	apiProvider *provider.ApiProvider
-	logger      *zap.Logger
+	factory provider.Factory
+	logger  *zap.Logger
 }
 
-func NewUsergroupsHandler(apiProvider *provider.ApiProvider, logger *zap.Logger) *UsergroupsHandler {
+func NewUsergroupsHandler(factory provider.Factory, logger *zap.Logger) *UsergroupsHandler {
 	return &UsergroupsHandler{
-		apiProvider: apiProvider,
-		logger:      logger,
+		factory: factory,
+		logger:  logger,
 	}
 }
 
@@ -42,7 +42,13 @@ func NewUsergroupsHandler(apiProvider *provider.ApiProvider, logger *zap.Logger)
 func (h *UsergroupsHandler) UsergroupsListHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	h.logger.Debug("UsergroupsListHandler called", zap.Any("params", request.Params))
 
-	if ready, err := h.apiProvider.IsReady(); !ready {
+	apiProvider, err := provider.ProviderFromContext(ctx, h.factory)
+	if err != nil {
+		h.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
+
+	if ready, err := apiProvider.IsReady(); !ready {
 		h.logger.Error("API provider not ready", zap.Error(err))
 		return nil, err
 	}
@@ -63,7 +69,7 @@ func (h *UsergroupsHandler) UsergroupsListHandler(ctx context.Context, request m
 		slack.GetUserGroupsOptionIncludeDisabled(includeDisabled),
 	}
 
-	groups, err := h.apiProvider.Slack().GetUserGroupsContext(ctx, options...)
+	groups, err := apiProvider.Slack().GetUserGroupsContext(ctx, options...)
 	if err != nil {
 		h.logger.Error("GetUserGroupsContext failed", zap.Error(err))
 		return nil, err
@@ -99,7 +105,13 @@ func (h *UsergroupsHandler) UsergroupsListHandler(ctx context.Context, request m
 func (h *UsergroupsHandler) UsergroupsCreateHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	h.logger.Debug("UsergroupsCreateHandler called", zap.Any("params", request.Params))
 
-	if ready, err := h.apiProvider.IsReady(); !ready {
+	apiProvider, err := provider.ProviderFromContext(ctx, h.factory)
+	if err != nil {
+		h.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
+
+	if ready, err := apiProvider.IsReady(); !ready {
 		h.logger.Error("API provider not ready", zap.Error(err))
 		return nil, err
 	}
@@ -131,7 +143,7 @@ func (h *UsergroupsHandler) UsergroupsCreateHandler(ctx context.Context, request
 		userGroup.Prefs.Channels = channels
 	}
 
-	created, err := h.apiProvider.Slack().CreateUserGroupContext(ctx, userGroup)
+	created, err := apiProvider.Slack().CreateUserGroupContext(ctx, userGroup)
 	if err != nil {
 		h.logger.Error("CreateUserGroupContext failed", zap.Error(err))
 		return nil, err
@@ -163,7 +175,13 @@ func (h *UsergroupsHandler) UsergroupsCreateHandler(ctx context.Context, request
 func (h *UsergroupsHandler) UsergroupsUpdateHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	h.logger.Debug("UsergroupsUpdateHandler called", zap.Any("params", request.Params))
 
-	if ready, err := h.apiProvider.IsReady(); !ready {
+	apiProvider, err := provider.ProviderFromContext(ctx, h.factory)
+	if err != nil {
+		h.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
+
+	if ready, err := apiProvider.IsReady(); !ready {
 		h.logger.Error("API provider not ready", zap.Error(err))
 		return nil, err
 	}
@@ -206,7 +224,7 @@ func (h *UsergroupsHandler) UsergroupsUpdateHandler(ctx context.Context, request
 		return nil, errors.New("at least one update field (name, handle, description, or channels) is required")
 	}
 
-	updated, err := h.apiProvider.Slack().UpdateUserGroupContext(ctx, usergroupID, options...)
+	updated, err := apiProvider.Slack().UpdateUserGroupContext(ctx, usergroupID, options...)
 	if err != nil {
 		h.logger.Error("UpdateUserGroupContext failed", zap.Error(err))
 		return nil, err
@@ -238,7 +256,13 @@ func (h *UsergroupsHandler) UsergroupsUpdateHandler(ctx context.Context, request
 func (h *UsergroupsHandler) UsergroupsUsersUpdateHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	h.logger.Debug("UsergroupsUsersUpdateHandler called", zap.Any("params", request.Params))
 
-	if ready, err := h.apiProvider.IsReady(); !ready {
+	apiProvider, err := provider.ProviderFromContext(ctx, h.factory)
+	if err != nil {
+		h.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
+
+	if ready, err := apiProvider.IsReady(); !ready {
 		h.logger.Error("API provider not ready", zap.Error(err))
 		return nil, err
 	}
@@ -259,7 +283,7 @@ func (h *UsergroupsHandler) UsergroupsUsersUpdateHandler(ctx context.Context, re
 	)
 
 	// UpdateUserGroupMembersContext expects a comma-separated string of user IDs
-	updated, err := h.apiProvider.Slack().UpdateUserGroupMembersContext(ctx, usergroupID, usersStr)
+	updated, err := apiProvider.Slack().UpdateUserGroupMembersContext(ctx, usergroupID, usersStr)
 	if err != nil {
 		h.logger.Error("UpdateUserGroupMembersContext failed", zap.Error(err))
 		return nil, err
@@ -296,7 +320,13 @@ func (h *UsergroupsHandler) UsergroupsUsersUpdateHandler(ctx context.Context, re
 func (h *UsergroupsHandler) UsergroupsMeHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	h.logger.Debug("UsergroupsMeHandler called", zap.Any("params", request.Params))
 
-	if ready, err := h.apiProvider.IsReady(); !ready {
+	apiProvider, err := provider.ProviderFromContext(ctx, h.factory)
+	if err != nil {
+		h.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
+
+	if ready, err := apiProvider.IsReady(); !ready {
 		h.logger.Error("API provider not ready", zap.Error(err))
 		return nil, err
 	}
@@ -307,7 +337,7 @@ func (h *UsergroupsHandler) UsergroupsMeHandler(ctx context.Context, request mcp
 	}
 
 	// Get current user ID
-	authResp, err := h.apiProvider.Slack().AuthTest()
+	authResp, err := apiProvider.Slack().AuthTest()
 	if err != nil {
 		h.logger.Error("AuthTest failed", zap.Error(err))
 		return nil, err
@@ -317,7 +347,7 @@ func (h *UsergroupsHandler) UsergroupsMeHandler(ctx context.Context, request mcp
 
 	// Handle list action
 	if action == "list" {
-		return h.handleListMyGroups(ctx, currentUserID)
+		return h.handleListMyGroups(ctx, apiProvider, currentUserID)
 	}
 
 	// For join/leave, usergroup_id is required
@@ -332,7 +362,7 @@ func (h *UsergroupsHandler) UsergroupsMeHandler(ctx context.Context, request mcp
 	)
 
 	// Get current members of the group
-	members, err := h.apiProvider.Slack().GetUserGroupMembersContext(ctx, usergroupID)
+	members, err := apiProvider.Slack().GetUserGroupMembersContext(ctx, usergroupID)
 	if err != nil {
 		h.logger.Error("GetUserGroupMembersContext failed", zap.Error(err))
 		return nil, err
@@ -371,7 +401,7 @@ func (h *UsergroupsHandler) UsergroupsMeHandler(ctx context.Context, request mcp
 
 	// Update the group members
 	membersStr := strings.Join(newMembers, ",")
-	updated, err := h.apiProvider.Slack().UpdateUserGroupMembersContext(ctx, usergroupID, membersStr)
+	updated, err := apiProvider.Slack().UpdateUserGroupMembersContext(ctx, usergroupID, membersStr)
 	if err != nil {
 		h.logger.Error("UpdateUserGroupMembersContext failed", zap.Error(err))
 		return nil, err
@@ -405,14 +435,14 @@ func (h *UsergroupsHandler) UsergroupsMeHandler(ctx context.Context, request mcp
 }
 
 // handleListMyGroups returns groups where the current user is a member
-func (h *UsergroupsHandler) handleListMyGroups(ctx context.Context, currentUserID string) (*mcp.CallToolResult, error) {
+func (h *UsergroupsHandler) handleListMyGroups(ctx context.Context, apiProvider *provider.ApiProvider, currentUserID string) (*mcp.CallToolResult, error) {
 	options := []slack.GetUserGroupsOption{
 		slack.GetUserGroupsOptionIncludeUsers(true),
 		slack.GetUserGroupsOptionIncludeCount(true),
 		slack.GetUserGroupsOptionIncludeDisabled(false),
 	}
 
-	groups, err := h.apiProvider.Slack().GetUserGroupsContext(ctx, options...)
+	groups, err := apiProvider.Slack().GetUserGroupsContext(ctx, options...)
 	if err != nil {
 		h.logger.Error("GetUserGroupsContext failed", zap.Error(err))
 		return nil, err

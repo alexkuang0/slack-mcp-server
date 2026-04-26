@@ -101,7 +101,19 @@ func shouldAddTool(name string, enabledTools []string, envVarName string) bool {
 	return false
 }
 
-func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledTools []string) *MCPServer {
+func NewMCPServer(factory provider.Factory, logger *zap.Logger, enabledTools []string) *MCPServer {
+	// Resolve the singleton provider for startup-time decisions (transport,
+	// bot-token gating, auth-test). In legacy mode this returns the wrapped
+	// singleton; in multi-tenant mode it returns the "default" provider for
+	// the zero-value tenant.
+	defaultProvider, err := factory.For(context.Background(), provider.TenantContext{})
+	if err != nil {
+		logger.Fatal("Failed to resolve default provider from factory",
+			zap.String("context", "console"),
+			zap.Error(err),
+		)
+	}
+
 	s := server.NewMCPServer(
 		"Slack MCP Server",
 		version.Version,
@@ -109,10 +121,10 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 		server.WithRecovery(),
 		server.WithToolHandlerMiddleware(buildErrorRecoveryMiddleware(logger)),
 		server.WithToolHandlerMiddleware(buildLoggerMiddleware(logger)),
-		server.WithToolHandlerMiddleware(auth.BuildMiddleware(provider.ServerTransport(), logger)),
+		server.WithToolHandlerMiddleware(auth.BuildMiddleware(defaultProvider.ServerTransport(), logger)),
 	)
 
-	conversationsHandler := handler.NewConversationsHandler(provider, logger)
+	conversationsHandler := handler.NewConversationsHandler(factory, logger)
 
 	if shouldAddTool(ToolConversationsHistory, enabledTools, "") {
 		s.AddTool(mcp.NewTool(ToolConversationsHistory,
@@ -280,7 +292,7 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 		),
 	)
 	// Only register search tool for non-bot tokens (bot tokens cannot use search.messages API)
-	if !provider.IsBotToken() && shouldAddTool(ToolConversationsSearchMessages, enabledTools, "") {
+	if !defaultProvider.IsBotToken() && shouldAddTool(ToolConversationsSearchMessages, enabledTools, "") {
 		s.AddTool(conversationsSearchTool, conversationsHandler.ConversationsSearchHandler)
 	}
 
@@ -302,7 +314,7 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 
 	// Register unreads tool - gets all unread messages across channels efficiently.
 	// Bot tokens (xoxb) don't support unread tracking, so exclude them (same pattern as search tool).
-	if !provider.IsBotToken() && shouldAddTool(ToolConversationsUnreads, enabledTools, "") {
+	if !defaultProvider.IsBotToken() && shouldAddTool(ToolConversationsUnreads, enabledTools, "") {
 		s.AddTool(mcp.NewTool(ToolConversationsUnreads,
 			mcp.WithDescription("Get unread messages across all channels. With browser session tokens (xoxc/xoxd), uses a single API call for complete results. With OAuth user tokens (xoxp), scans a subset of channels per type (limited by max_channels) — results may be partial on large workspaces. Results are prioritized: DMs > group DMs > partner channels > internal channels."),
 			mcp.WithTitleAnnotation("Get Unread Messages"),
@@ -349,8 +361,8 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 			),
 		), conversationsHandler.ConversationsMarkHandler)
 	}
-	channelsHandler := handler.NewChannelsHandler(provider, logger)
-	usergroupsHandler := handler.NewUsergroupsHandler(provider, logger)
+	channelsHandler := handler.NewChannelsHandler(factory, logger)
+	usergroupsHandler := handler.NewUsergroupsHandler(factory, logger)
 
 	if shouldAddTool(ToolChannelsList, enabledTools, "") {
 		s.AddTool(mcp.NewTool(ToolChannelsList,
@@ -473,7 +485,7 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 	logger.Info("Authenticating with Slack API...",
 		zap.String("context", "console"),
 	)
-	ar, err := provider.Slack().AuthTest()
+	ar, err := defaultProvider.Slack().AuthTest()
 	if err != nil {
 		logger.Fatal("Failed to authenticate with Slack",
 			zap.String("context", "console"),

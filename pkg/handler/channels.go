@@ -25,41 +25,47 @@ type Channel struct {
 }
 
 type ChannelsHandler struct {
-	apiProvider *provider.ApiProvider
-	validTypes  map[string]bool
-	logger      *zap.Logger
+	factory    provider.Factory
+	validTypes map[string]bool
+	logger     *zap.Logger
 }
 
-func NewChannelsHandler(apiProvider *provider.ApiProvider, logger *zap.Logger) *ChannelsHandler {
+func NewChannelsHandler(factory provider.Factory, logger *zap.Logger) *ChannelsHandler {
 	validTypes := make(map[string]bool, len(provider.AllChanTypes))
 	for _, v := range provider.AllChanTypes {
 		validTypes[v] = true
 	}
 
 	return &ChannelsHandler{
-		apiProvider: apiProvider,
-		validTypes:  validTypes,
-		logger:      logger,
+		factory:    factory,
+		validTypes: validTypes,
+		logger:     logger,
 	}
 }
 
 func (ch *ChannelsHandler) ChannelsResource(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 	ch.logger.Debug("ChannelsResource called", zap.Any("params", request.Params))
 
+	apiProvider, err := provider.ProviderFromContext(ctx, ch.factory)
+	if err != nil {
+		ch.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
+
 	// mark3labs/mcp-go does not support middlewares for resources.
-	if authenticated, err := auth.IsAuthenticated(ctx, ch.apiProvider.ServerTransport(), ch.logger); !authenticated {
+	if authenticated, err := auth.IsAuthenticated(ctx, apiProvider.ServerTransport(), ch.logger); !authenticated {
 		ch.logger.Error("Authentication failed for channels resource", zap.Error(err))
 		return nil, err
 	}
 
 	var channelList []Channel
 
-	if ready, err := ch.apiProvider.IsReady(); !ready {
+	if ready, err := apiProvider.IsReady(); !ready {
 		ch.logger.Error("API provider not ready", zap.Error(err))
 		return nil, err
 	}
 
-	ar, err := ch.apiProvider.Slack().AuthTest()
+	ar, err := apiProvider.Slack().AuthTest()
 	if err != nil {
 		ch.logger.Error("Auth test failed", zap.Error(err))
 		return nil, err
@@ -74,7 +80,7 @@ func (ch *ChannelsHandler) ChannelsResource(ctx context.Context, request mcp.Rea
 		return nil, fmt.Errorf("failed to parse workspace from URL: %v", err)
 	}
 
-	channels := ch.apiProvider.ProvideChannelsMaps().Channels
+	channels := apiProvider.ProvideChannelsMaps().Channels
 	ch.logger.Debug("Retrieved channels from provider", zap.Int("count", len(channels)))
 
 	for _, channel := range channels {
@@ -105,7 +111,13 @@ func (ch *ChannelsHandler) ChannelsResource(ctx context.Context, request mcp.Rea
 func (ch *ChannelsHandler) ChannelsHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("ChannelsHandler called")
 
-	if ready, err := ch.apiProvider.IsReady(); !ready {
+	apiProvider, err := provider.ProviderFromContext(ctx, ch.factory)
+	if err != nil {
+		ch.logger.Error("Failed to resolve provider for tenant", zap.Error(err))
+		return nil, err
+	}
+
+	if ready, err := apiProvider.IsReady(); !ready {
 		ch.logger.Error("API provider not ready", zap.Error(err))
 		return nil, err
 	}
@@ -156,7 +168,7 @@ func (ch *ChannelsHandler) ChannelsHandler(ctx context.Context, request mcp.Call
 		channelList []Channel
 	)
 
-	allChannels := ch.apiProvider.ProvideChannelsMaps().Channels
+	allChannels := apiProvider.ProvideChannelsMaps().Channels
 	ch.logger.Debug("Total channels available", zap.Int("count", len(allChannels)))
 
 	channels := filterChannelsByTypes(allChannels, channelTypes)
